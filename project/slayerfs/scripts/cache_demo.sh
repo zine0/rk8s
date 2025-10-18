@@ -12,6 +12,8 @@ echo "Starting SlayerFS..."
 cargo run --example persistence_demo -- --config "$CONFIG_FILE" --mount "/tmp/mount" --storage "/tmp/sqlite" > "$LOG_FILE" 2>&1 &
 DEMO_PID=$!
 
+# Ensure background process is killed on exit or error
+trap 'if kill -0 "$DEMO_PID" 2>/dev/null; then kill "$DEMO_PID"; fi' EXIT ERR INT
 # Wait for mount
 sleep 3
 

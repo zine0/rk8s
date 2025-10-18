@@ -12,6 +12,7 @@ use hex::encode;
 use libc::{KEYCTL_CAPS0_CAPABILITIES, SYS_remap_file_pages, VM_VFS_CACHE_PRESSURE};
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
+use tracing::info;
 use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -238,6 +239,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         match self.block_cache.get(&cache_key).await {
             Some(block) => {
                 buf.copy_from_slice(&block[start..end]);
+                info!("Read block range from cache");
             }
             None => {
                 let block = self

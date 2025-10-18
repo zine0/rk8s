@@ -34,7 +34,6 @@ for round in {1..3}; do
     for i in {1..3}; do
         cat "/tmp/mount/test$i.txt" > /dev/null
     done
-    sleep 1
 done
 
 echo "Checking logs for cache messages..."

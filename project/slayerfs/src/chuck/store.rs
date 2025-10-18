@@ -12,9 +12,9 @@ use hex::encode;
 use libc::{KEYCTL_CAPS0_CAPABILITIES, SYS_remap_file_pages, VM_VFS_CACHE_PRESSURE};
 use moka::{Entry, ops::compute::Op};
 use sha2::{Digest, Sha256};
-use tracing::info;
 use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tracing::info;
 
 /// 抽象块存储接口（后续可由 cadapter/S3 等实现）。
 #[async_trait]

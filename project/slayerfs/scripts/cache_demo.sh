@@ -38,7 +38,7 @@ done
 
 echo "Checking logs for cache messages..."
 echo "=== Cache-related messages ==="
-grep -i "cache\|hit\|remove\|chunks" "$LOG_FILE" | head -20
+grep -iE "cache|hit|remove|chunks" "$LOG_FILE" | head -20
 
 echo ""
 echo "Demo completed. Full log saved to: $LOG_FILE"

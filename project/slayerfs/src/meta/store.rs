@@ -287,6 +287,9 @@ pub enum MetaError {
     #[error("Session not found")]
     SessionNotFound,
 
+    #[error("Invalid handle: {0}")]
+    InvalidHandle(u64),
+
     #[error("error: {0}")]
     Anyhow(#[from] anyhow::Error),
 }

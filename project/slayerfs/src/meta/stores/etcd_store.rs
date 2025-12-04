@@ -1848,7 +1848,7 @@ impl MetaStore for EtcdMetaStore {
                 MetaError::Internal(format!("Error to deserialize value to json:{}", err))
             })?;
 
-            if session_value < (Utc::now() - Duration::minutes(5)).timestamp_millis() {
+            if session_value < Utc::now().timestamp_millis() {
                 self.shutdown_session(session_id).await?;
             }
         }

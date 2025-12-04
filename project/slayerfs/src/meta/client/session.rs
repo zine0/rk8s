@@ -18,8 +18,6 @@ pub struct Session {
 
 impl Session {
     pub async fn new(session_id: Uuid, expire: i64, session_info: SessionInfo) -> Self {
-        
-
         Session {
             session_id,
             expire,
@@ -59,10 +57,6 @@ impl<M: MetaStore + 'static> SessionManager<M> {
         }
     }
 
-    pub async fn session_id(&self) -> Option<Uuid> {
-        *self.session_id.read().await
-    }
-
     pub async fn start(&self, session_info: SessionInfo) -> Result<(), MetaError> {
         let session = self.store.new_session(session_info).await?;
         let session_id = session.session_id;
@@ -86,13 +80,15 @@ impl<M: MetaStore + 'static> SessionManager<M> {
 
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
-        match self
-            .store
-            .shutdown_session(self.session_id.read().await.unwrap())
-            .await
-        {
-            Ok(_) => (),
-            Err(err) => error!("Failed to clean session: {}", err),
+        // Attempt to read the session_id, handling poisoned lock and missing session
+        match *self.session_id.read().await {
+            Some(session_id) => match self.store.shutdown_session(session_id).await {
+                Ok(_) => (),
+                Err(err) => error!("Failed to clean session: {}", err),
+            },
+            None => {
+                error!("No session_id found during shutdown; session may not have been started.");
+            }
         }
     }
 }

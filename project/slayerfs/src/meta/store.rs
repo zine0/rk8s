@@ -284,8 +284,8 @@ pub enum MetaError {
     #[error("Config error: {0}")]
     Config(String),
 
-    #[error("Session not found")]
-    SessionNotFound,
+    #[error("Session not found: {0}")]
+    SessionNotFound(Uuid),
 
     #[error("Invalid handle: {0}")]
     InvalidHandle(u64),

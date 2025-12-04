@@ -13,13 +13,14 @@ use crate::meta::store::{DirEntry, FileAttr, FileType, LockName, MetaError, Meta
 use crate::meta::{INODE_ID_KEY, SESSION_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
 use chrono::Utc;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::error;
 use uuid::Uuid;
 
 const ROOT_INODE: i64 = 1;
@@ -605,9 +606,9 @@ impl MetaStore for RedisMetaStore {
             local new_value = tonumber(ARGV[2])
             local diff = tonumber(ARGV[3])
 
-            local current_time = redis.call("HGET",key,field)
+            local current_value = redis.call("HGET",key,field)
 
-            if current_time == false then
+            if current_value == false then
                 redis.call("HSET",key,field,new_value)
                 return true
             else
@@ -615,7 +616,7 @@ impl MetaStore for RedisMetaStore {
                 if current_value > new_value - diff then
                     return {false, current_value}
                 else
-                    redis.call('SET', key, new_value)
+                    redis.call('HSET', key, new_value)
                     return {true, new_value}
                 end
             end
@@ -624,14 +625,21 @@ impl MetaStore for RedisMetaStore {
 
         let diff = chrono::Duration::seconds(7).num_milliseconds();
 
-        script
+        let resp: Result<bool, _> = script
             .key(LOCKS_KEY)
             .arg(lock_name)
             .arg(now)
             .arg(diff)
             .invoke_async(&mut conn)
-            .await
-            .unwrap_or_default()
+            .await;
+
+        match resp {
+            Ok(v) => v,
+            Err(err) => {
+                error!("{}", err.to_string());
+                false
+            }
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

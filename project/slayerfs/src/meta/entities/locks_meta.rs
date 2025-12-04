@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "locks")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    lock_name: String,
-    last_updated: DateTimeUtc,
+    pub lock_name: String,
+    pub last_updated: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

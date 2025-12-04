@@ -12,7 +12,7 @@ use crate::meta::store::{
     DirEntry, FileAttr, LockName, MetaError, MetaStore, OpenFlags, SetAttrFlags, SetAttrRequest,
     StatFsSnapshot,
 };
-use crate::meta::{Permission, INODE_ID_KEY, SLICE_ID_KEY};
+use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -438,15 +438,24 @@ impl DatabaseMetaStore {
             .await?;
 
         let new = Utc::now();
+        let flag: bool;
         match lock_ {
             Some(lock) => {
                 let mut lock = lock.into_active_model();
 
-                let old = lock.last_updated.unwrap();
+                let old = match &lock.last_updated {
+                    ActiveValue::Set(val) | ActiveValue::Unchanged(val) => *val,
+                    ActiveValue::NotSet => {
+                        return Err(anyhow::anyhow!("Lock last_updated field is not set"));
+                    }
+                };
 
                 if old < new - Duration::seconds(7) {
                     lock.last_updated = ActiveValue::Set(new);
                     lock.update(&txn).await?;
+                    flag = false;
+                } else {
+                    flag = true;
                 }
             }
             None => {
@@ -455,11 +464,12 @@ impl DatabaseMetaStore {
                     last_updated: ActiveValue::Set(new),
                 };
                 lock.insert(&txn).await?;
+                flag = true;
             }
         };
 
         txn.commit().await.map_err(MetaError::Database)?;
-        Ok(true)
+        Ok(flag)
     }
 
     async fn shutdown_session_internal<C: ConnectionTrait>(
@@ -471,7 +481,10 @@ impl DatabaseMetaStore {
             .filter(session_meta::Column::SessionId.eq(session_id))
             .one(conn)
             .await?;
-        let session = session.unwrap().into_active_model();
+        let session = match session {
+            Some(s) => s.into_active_model(),
+            None => return Err(MetaError::SessionNotFound(session_id)),
+        };
         session.delete(conn).await.map_err(MetaError::Database)?;
         Ok(())
     }
@@ -1485,7 +1498,10 @@ impl MetaStore for DatabaseMetaStore {
             .filter(session_meta::Column::SessionId.eq(session_id))
             .one(&txn)
             .await?;
-        let mut session = session.unwrap().into_active_model();
+        let mut session = match session {
+            Some(s) => s.into_active_model(),
+            None => return Err(MetaError::SessionNotFound(session_id)),
+        };
         session.expire = Set(expire);
         session.update(&txn).await.map_err(MetaError::Database)?;
         txn.commit().await.map_err(MetaError::Database)?;

@@ -612,12 +612,9 @@ impl MetaStore for RedisMetaStore {
                 return true
             else
                 current_value = tonumber(current_value)
-                -- 检查条件
                 if current_value > new_value - diff then
-                    -- 不需要更新
                     return {false, current_value}
                 else
-                    -- 需要更新
                     redis.call('SET', key, new_value)
                     return {true, new_value}
                 end

@@ -2,8 +2,8 @@
 //!
 //! Uses Etcd/etcd as the backend for metadata storage
 
-use crate::chuck::SliceDesc;
 use crate::chuck::slice::key_for_slice;
+use crate::chuck::SliceDesc;
 use crate::meta::backoff::backoff;
 use crate::meta::client::session::{Session, SessionInfo};
 use crate::meta::config::{Config, DatabaseType};
@@ -11,13 +11,13 @@ use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, LockName, MetaError, MetaStore};
 use crate::meta::stores::pool::IdPool;
-use crate::meta::{INODE_ID_KEY, Permission};
+use crate::meta::{Permission, INODE_ID_KEY};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, Txn, TxnOp};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1794,7 +1794,7 @@ impl MetaStore for EtcdMetaStore {
 
     async fn refresh_session(&self, session_id: Uuid) -> Result<(), MetaError> {
         let session_key = Self::etcd_session_key(Some(session_id));
-        let new_expire = Utc::now() + Duration::minutes(5);
+        let new_expire = (Utc::now() + Duration::minutes(5)).timestamp_millis();
 
         self.atomic_update(
             &session_key,
@@ -1815,10 +1815,9 @@ impl MetaStore for EtcdMetaStore {
             TxnOp::delete(session_key, None),
             TxnOp::delete(session_info_key, None),
         ]);
-        client
-            .txn(txn)
-            .await
-            .map_err(|err| MetaError::Internal(format!("Error to shutdown session: {}", err)))?;
+        client.txn(txn).await.map_err(|err| {
+            MetaError::Internal(format!("Error to shutting down session: {}", err))
+        })?;
         Ok(())
     }
 
@@ -1830,11 +1829,11 @@ impl MetaStore for EtcdMetaStore {
                 Some(GetOptions::new().with_prefix()),
             )
             .await
-            .map_err(|err| MetaError::Internal(format!("Error to get keys: {}", err)))?;
+            .map_err(|err| MetaError::Internal(format!("Error to getting keys: {}", err)))?;
         let sessions = resp.kvs();
         for session in sessions {
             let session_key = session.key_str().map_err(|err| {
-                MetaError::Internal(format!("Error to deserialize key to str:{}", err))
+                MetaError::Internal(format!("Error to deserializing key to string:{}", err))
             })?;
 
             let session_id =
@@ -1842,10 +1841,10 @@ impl MetaStore for EtcdMetaStore {
                     format!("Error to parse session id from key: {}", session_key),
                 ))?;
             let session_value = session.value_str().map_err(|err| {
-                MetaError::Internal(format!("Error to deserialize value to str:{}", err))
+                MetaError::Internal(format!("Error deserializing value to string:{}", err))
             })?;
             let session_value: i64 = serde_json::from_str(session_value).map_err(|err| {
-                MetaError::Internal(format!("Error to deserialize value to json:{}", err))
+                MetaError::Internal(format!("Error to deserializing value to JSON:{}", err))
             })?;
 
             if session_value < Utc::now().timestamp_millis() {
@@ -1877,7 +1876,7 @@ impl MetaStore for EtcdMetaStore {
         match result {
             Ok(flag) => flag,
             Err(err) => {
-                error!("Error to get lock: {}", err);
+                error!("Error to getting lock: {}", err);
                 false
             }
         }
@@ -1894,7 +1893,7 @@ mod tests {
     use crate::chuck::SliceDesc;
     use crate::meta::config::{CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType};
     use crate::meta::entities::etcd::{EtcdDirChildren, EtcdEntryInfo};
-    use crate::meta::{INODE_ID_KEY, Permission};
+    use crate::meta::{Permission, INODE_ID_KEY};
     use std::sync::Arc;
 
     fn test_config() -> Config {

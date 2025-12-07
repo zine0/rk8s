@@ -16,11 +16,11 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use if_addrs::get_if_addrs;
 use moka::future::Cache;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashSet, process};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::vfs::extract_ino_and_chunk_index;
@@ -258,8 +258,8 @@ impl<T: MetaStore + 'static> MetaClient<T> {
     }
     /// Starts a background heartbeat session with the underlying store.
     ///
-    /// Callers provide an opaque payload understood by the backend; the client
-    /// will register or update the session and then begin periodic heartbeats.
+    /// Callers provide a `SessionInfo` struct containing session parameters understood by the backend;
+    /// the client will register or update the session and then begin periodic heartbeats.
     #[allow(dead_code)]
     pub async fn start_session(&self, session_info: SessionInfo) -> Result<(), MetaError> {
         if self.options.read_only {

@@ -13,8 +13,8 @@ use crate::meta::store::{DirEntry, FileAttr, FileType, LockName, MetaError, Meta
 use crate::meta::{INODE_ID_KEY, SESSION_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
 use chrono::Utc;
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::path::Path;
@@ -603,21 +603,21 @@ impl MetaStore for RedisMetaStore {
             r#"
             local key = KEYS[1]
             local field = ARGV[1]
-            local new_value = tonumber(ARGV[2])
+            local now_time = tonumber(ARGV[2])
             local diff = tonumber(ARGV[3])
 
-            local current_value = redis.call("HGET",key,field)
+            local last_updated = redis.call("HGET",key,field)
 
-            if current_value == false then
+            if last_updated == false then
                 redis.call("HSET",key,field,new_value)
                 return true
             else
-                current_value = tonumber(current_value)
-                if current_value > new_value - diff then
-                    return {false, current_value}
+                last_updated = tonumber(last_updated)
+                if now_time < last_updated + diff then
+                    return false
                 else
-                    redis.call('HSET', key, new_value)
-                    return {true, new_value}
+                    redis.call('HSET', key,field, new_value)
+                    return true
                 end
             end
             "#,

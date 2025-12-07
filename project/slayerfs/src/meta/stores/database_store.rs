@@ -12,7 +12,7 @@ use crate::meta::store::{
     DirEntry, FileAttr, LockName, MetaError, MetaStore, OpenFlags, SetAttrFlags, SetAttrRequest,
     StatFsSnapshot,
 };
-use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
+use crate::meta::{Permission, INODE_ID_KEY, SLICE_ID_KEY};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -437,31 +437,31 @@ impl DatabaseMetaStore {
             .one(&txn)
             .await?;
 
-        let new = Utc::now();
+        let current_time = Utc::now();
         let flag: bool;
         match lock_ {
             Some(lock) => {
                 let mut lock = lock.into_active_model();
 
-                let old = match &lock.last_updated {
+                let last_updated = match &lock.last_updated {
                     ActiveValue::Set(val) | ActiveValue::Unchanged(val) => *val,
                     ActiveValue::NotSet => {
                         return Err(anyhow::anyhow!("Lock last_updated field is not set"));
                     }
                 };
 
-                if old < new - Duration::seconds(7) {
-                    lock.last_updated = ActiveValue::Set(new);
+                if last_updated < current_time - Duration::seconds(7) {
+                    lock.last_updated = ActiveValue::Set(current_time);
                     lock.update(&txn).await?;
-                    flag = false;
-                } else {
                     flag = true;
+                } else {
+                    flag = false;
                 }
             }
             None => {
                 let lock = locks_meta::ActiveModel {
                     lock_name: ActiveValue::Set(lock_name_str),
-                    last_updated: ActiveValue::Set(new),
+                    last_updated: ActiveValue::Set(current_time),
                 };
                 lock.insert(&txn).await?;
                 flag = true;

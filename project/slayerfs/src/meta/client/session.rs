@@ -7,7 +7,7 @@ use tokio::{select, sync::RwLock, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
-use crate::meta::{MetaStore, store::MetaError};
+use crate::meta::{store::MetaError, MetaStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -28,7 +28,7 @@ impl Session {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
-    /// Session UUID for unique identification
+    /// Version string identifying the client or protocol version
     pub version: String,
     pub host_name: String,
     pub ip_addrs: Vec<String>,

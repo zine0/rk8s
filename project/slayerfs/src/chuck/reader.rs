@@ -4,7 +4,7 @@ use super::chunk::ChunkLayout;
 use super::slice::{Read, SliceDesc, SliceIO};
 use super::store::BlockStore;
 use crate::meta::MetaStore;
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use futures_util::{StreamExt, TryStreamExt};
 use std::cmp::{max, min};
 
@@ -331,15 +331,11 @@ mod tests {
         let res = r.read(off, layout.block_size as usize).await.unwrap();
         assert_eq!(res.len(), layout.block_size as usize);
         // The first half should be zero-filled and the second half should be ones
-        assert!(
-            res[..(layout.block_size / 2) as usize]
-                .iter()
-                .all(|&b| b == 0)
-        );
-        assert!(
-            res[(layout.block_size / 2) as usize..]
-                .iter()
-                .all(|&b| b == 1)
-        );
+        assert!(res[..(layout.block_size / 2) as usize]
+            .iter()
+            .all(|&b| b == 0));
+        assert!(res[(layout.block_size / 2) as usize..]
+            .iter()
+            .all(|&b| b == 1));
     }
 }

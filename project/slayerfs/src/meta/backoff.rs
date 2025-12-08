@@ -1,5 +1,5 @@
 use crate::meta::store::MetaError;
-use rand::{RngCore, rng};
+use rand::{rng, RngCore};
 use std::{future::Future, time::Duration};
 
 pub async fn backoff<F, Fut, R>(max_retries: u64, mut f: F) -> Result<R, MetaError>

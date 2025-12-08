@@ -4,7 +4,7 @@ use crate::cadapter::client::{ObjectBackend, ObjectClient};
 use crate::chuck::ChunkLayout;
 use crate::meta::store::MetaStore;
 use std::sync::Arc;
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 use tracing::{debug, error, info};
 
 #[allow(dead_code)]

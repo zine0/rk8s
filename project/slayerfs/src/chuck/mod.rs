@@ -24,7 +24,7 @@ pub mod util;
 pub mod writer;
 
 pub use chunk::{
-    ChunkLayout, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, chunk_index_of, within_chunk_offset,
+    chunk_index_of, within_chunk_offset, ChunkLayout, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE,
 };
 pub use reader::ChunkReader;
 pub use slice::{BlockSpan, SliceDesc};

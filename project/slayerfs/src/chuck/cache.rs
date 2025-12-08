@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     hash,
@@ -10,7 +10,7 @@ use std::{
 use anyhow::anyhow;
 use dirs::cache_dir;
 use sea_orm::sea_query::WindowSelectType;
-use sha2::{Digest, Sha256, digest::KeyInit};
+use sha2::{digest::KeyInit, Digest, Sha256};
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
@@ -483,7 +483,11 @@ impl AccessStats {
         let weighted_freq = short_freq * short_norm + medium_freq * medium_norm;
         trace!(
             "Weighted frequency: short={} ({:.2}), medium={} ({:.2}) -> weighted={:.2}",
-            short_freq, short_norm, medium_freq, medium_norm, weighted_freq
+            short_freq,
+            short_norm,
+            medium_freq,
+            medium_norm,
+            weighted_freq
         );
 
         weighted_freq
@@ -722,7 +726,9 @@ impl SystemMetrics {
 
         trace!(
             "Recording cache request: hit={}, total_requests={}, cache_hits={}",
-            hit, total, hits
+            hit,
+            total,
+            hits
         );
 
         // Update sliding window request tracking
@@ -1022,7 +1028,8 @@ impl Policy {
         let threshold = self.calculate_adaptive_threshold();
         trace!(
             "Calculated promotion threshold for key '{}': {:.2}",
-            key, threshold
+            key,
+            threshold
         );
 
         // Use read lock to check promotion conditions, reduce lock contention
@@ -1327,7 +1334,8 @@ impl ChunksCache {
         let max_size = self.config.hot_cache_size as u64;
         trace!(
             "Updating cache utilization: {}/{} entries",
-            current_size, max_size
+            current_size,
+            max_size
         );
         self.policy.update_cache_utilization(current_size, max_size);
     }

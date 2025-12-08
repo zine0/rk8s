@@ -8,8 +8,8 @@ use anyhow::{self, Context};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use hex::encode;
-use libc::{KEYCTL_CAPS0_CAPABILITIES, SYS_remap_file_pages, VM_VFS_CACHE_PRESSURE};
-use moka::{Entry, ops::compute::Op};
+use libc::{SYS_remap_file_pages, KEYCTL_CAPS0_CAPABILITIES, VM_VFS_CACHE_PRESSURE};
+use moka::{ops::compute::Op, Entry};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io::SeekFrom, path::PathBuf};
 use tokio::{

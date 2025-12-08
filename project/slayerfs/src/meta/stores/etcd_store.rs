@@ -1815,9 +1815,10 @@ impl MetaStore for EtcdMetaStore {
             TxnOp::delete(session_key, None),
             TxnOp::delete(session_info_key, None),
         ]);
-        client.txn(txn).await.map_err(|err| {
-            MetaError::Internal(format!("Error to shutting down session: {}", err))
-        })?;
+        client
+            .txn(txn)
+            .await
+            .map_err(|err| MetaError::Internal(format!("Error shutting down session: {}", err)))?;
         Ok(())
     }
 
@@ -1829,22 +1830,21 @@ impl MetaStore for EtcdMetaStore {
                 Some(GetOptions::new().with_prefix()),
             )
             .await
-            .map_err(|err| MetaError::Internal(format!("Error to getting keys: {}", err)))?;
+            .map_err(|err| MetaError::Internal(format!("Error getting keys: {}", err)))?;
         let sessions = resp.kvs();
         for session in sessions {
             let session_key = session.key_str().map_err(|err| {
-                MetaError::Internal(format!("Error to deserializing key to string:{}", err))
+                MetaError::Internal(format!("Error deserializing key to string:{}", err))
             })?;
 
-            let session_id =
-                Self::get_session_id_from_session_key(session_key).ok_or(MetaError::Internal(
-                    format!("Error to parse session id from key: {}", session_key),
-                ))?;
+            let session_id = Self::get_session_id_from_session_key(session_key).ok_or(
+                MetaError::Internal(format!("Error parse session id from key: {}", session_key)),
+            )?;
             let session_value = session.value_str().map_err(|err| {
                 MetaError::Internal(format!("Error deserializing value to string:{}", err))
             })?;
             let session_value: i64 = serde_json::from_str(session_value).map_err(|err| {
-                MetaError::Internal(format!("Error to deserializing value to JSON:{}", err))
+                MetaError::Internal(format!("Error deserializing value to JSON:{}", err))
             })?;
 
             if session_value < Utc::now().timestamp_millis() {
@@ -1876,7 +1876,7 @@ impl MetaStore for EtcdMetaStore {
         match result {
             Ok(flag) => flag,
             Err(err) => {
-                error!("Error to getting lock: {}", err);
+                error!("Error getting lock: {}", err);
                 false
             }
         }

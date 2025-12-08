@@ -1,8 +1,8 @@
 //! Etcd backend-specific data structures
 
-use crate::meta::Permission;
 use crate::meta::entities::content_meta::EntryType;
 use crate::meta::store::{FileAttr, FileType};
+use crate::meta::Permission;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

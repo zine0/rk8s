@@ -10,8 +10,8 @@ use crate::meta::store::MetaError;
 use crate::meta::{MetaLayer, MetaStore};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -423,7 +423,11 @@ where
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
         let mut out = String::from("/");
         out.push_str(&parts.join("/"));
-        if out.is_empty() { "/".into() } else { out }
+        if out.is_empty() {
+            "/".into()
+        } else {
+            out
+        }
     }
 
     /// Split a normalized path into parent directory and basename.
@@ -1113,8 +1117,8 @@ mod tests {
     use crate::chuck::store::ObjectBlockStore;
     use crate::meta::factory::create_meta_store_from_url;
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::sync::{Barrier, Notify};
     use tokio::time::{sleep, timeout};
 
@@ -1146,11 +1150,9 @@ mod tests {
         assert_eq!(out, data);
 
         let entries = fs.readdir("/a/b").await.expect("readdir");
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.name == "hello.txt" && e.kind == FileType::File)
-        );
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "hello.txt" && e.kind == FileType::File));
 
         let stat = fs.stat("/a/b/hello.txt").await.unwrap();
         assert_eq!(stat.kind, FileType::File);

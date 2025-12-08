@@ -1479,10 +1479,10 @@ impl MetaStore for DatabaseMetaStore {
             session_info: Set(payload),
             expire: Set(expire),
         };
-        session
-            .insert(&self.db)
-            .await
-            .map_err(MetaError::Database)?;
+        if let Err(e) = session.insert(&self.db).await {
+            let _ = txn.rollback().await;
+            return Err(MetaError::Database(e));
+        }
         txn.commit().await.map_err(MetaError::Database)?;
         Ok(Session {
             session_id,

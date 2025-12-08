@@ -1,16 +1,16 @@
 //! S3 adapter: simplified aws-sdk-s3 implementation with multipart upload, retries, and validation.
 
 use crate::cadapter::client::ObjectBackend;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::SdkBody;
-use aws_sdk_s3::{Client, config::Region};
-use base64::Engine as _;
+use aws_sdk_s3::{config::Region, Client};
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use md5;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 /// S3 backend configuration options
 #[derive(Debug, Clone)]

@@ -1,7 +1,7 @@
 use bitflags::bitflags;
 use sea_orm::{
-    sea_query::{ValueType, ValueTypeErr},
     DbErr, QueryResult, TryGetError, TryGetable, Value,
+    sea_query::{ValueType, ValueTypeErr},
 };
 use serde::{Deserialize, Serialize};
 

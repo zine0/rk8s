@@ -7,9 +7,9 @@
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
+use crate::meta::MetaStore;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::store::MetaError;
-use crate::meta::MetaStore;
 use crate::vfs::fs::{DirEntry, FileAttr, VFS};
 use std::path::Path;
 

@@ -7,7 +7,7 @@ use tokio::{select, sync::RwLock, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
-use crate::meta::{store::MetaError, MetaStore};
+use crate::meta::{MetaStore, store::MetaError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {

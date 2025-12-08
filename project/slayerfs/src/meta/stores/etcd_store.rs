@@ -2,8 +2,8 @@
 //!
 //! Uses Etcd/etcd as the backend for metadata storage
 
-use crate::chuck::slice::key_for_slice;
 use crate::chuck::SliceDesc;
+use crate::chuck::slice::key_for_slice;
 use crate::meta::backoff::backoff;
 use crate::meta::client::session::{Session, SessionInfo};
 use crate::meta::config::{Config, DatabaseType};
@@ -11,13 +11,13 @@ use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, LockName, MetaError, MetaStore};
 use crate::meta::stores::pool::IdPool;
-use crate::meta::{Permission, INODE_ID_KEY};
+use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, Txn, TxnOp};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1893,7 +1893,7 @@ mod tests {
     use crate::chuck::SliceDesc;
     use crate::meta::config::{CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType};
     use crate::meta::entities::etcd::{EtcdDirChildren, EtcdEntryInfo};
-    use crate::meta::{Permission, INODE_ID_KEY};
+    use crate::meta::{INODE_ID_KEY, Permission};
     use std::sync::Arc;
 
     fn test_config() -> Config {

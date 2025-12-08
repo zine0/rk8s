@@ -16,11 +16,11 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use if_addrs::get_if_addrs;
 use moka::future::Cache;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use std::{collections::HashSet, process};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::vfs::extract_ino_and_chunk_index;

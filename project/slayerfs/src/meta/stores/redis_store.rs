@@ -13,8 +13,8 @@ use crate::meta::store::{DirEntry, FileAttr, FileType, LockName, MetaError, Meta
 use crate::meta::{INODE_ID_KEY, SESSION_ID_KEY, SLICE_ID_KEY};
 use async_trait::async_trait;
 use chrono::Utc;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::path::Path;

@@ -12,7 +12,7 @@ use crate::meta::store::{
     DirEntry, FileAttr, LockName, MetaError, MetaStore, OpenFlags, SetAttrFlags, SetAttrRequest,
     StatFsSnapshot,
 };
-use crate::meta::{Permission, INODE_ID_KEY, SLICE_ID_KEY};
+use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};

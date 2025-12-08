@@ -45,9 +45,9 @@ impl<'a, B: BlockStore, S: MetaStore> ChunkWriter<'a, B, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chuck::ChunkReader;
     use crate::chuck::chunk::DEFAULT_BLOCK_SIZE;
     use crate::chuck::store::InMemoryBlockStore;
-    use crate::chuck::ChunkReader;
     use crate::meta::factory::create_meta_store_from_url;
 
     #[tokio::test]

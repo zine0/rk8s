@@ -20,13 +20,17 @@ use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, Txn, TxnOp};
+use etcd_client::{
+    Client as EtcdClient, Compare, CompareOp, GetOptions, LeaseKeeper, PutOptions, Txn, TxnOp,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -42,6 +46,7 @@ pub struct EtcdMetaStore {
     /// Local ID pools keyed by counter key (inode, slice, etc.)
     id_pools: IdPool,
     sid: OnceLock<Uuid>,
+    lease: OnceLock<i64>,
 }
 
 #[allow(dead_code)]
@@ -99,6 +104,7 @@ impl EtcdMetaStore {
             _config,
             id_pools: IdPool::default(),
             sid: OnceLock::new(),
+            lease: OnceLock::new(),
         };
         store.init_root_directory().await?;
 
@@ -116,6 +122,7 @@ impl EtcdMetaStore {
             _config,
             id_pools: IdPool::default(),
             sid: OnceLock::new(),
+            lease: OnceLock::new(),
         };
         store.init_root_directory().await?;
 
@@ -171,6 +178,7 @@ impl EtcdMetaStore {
         &self,
         key: impl AsRef<str>,
         obj: &T,
+        options: Option<PutOptions>,
     ) -> Result<(), MetaError> {
         let mut client = self.client.clone();
 
@@ -178,7 +186,7 @@ impl EtcdMetaStore {
         let key = key.as_ref();
 
         client
-            .put(key, json, None)
+            .put(key, json, options)
             .await
             .map(|_| ())
             .map_err(|e| MetaError::Internal(format!("Failed to put key {key}: {e}")))
@@ -668,6 +676,7 @@ impl EtcdMetaStore {
                     ))
                 },
                 10,
+                &None,
             )
             .await?;
 
@@ -700,6 +709,7 @@ impl EtcdMetaStore {
         f: F,
         init: I,
         max_retries: u64,
+        options: &Option<PutOptions>,
     ) -> Result<R, MetaError>
     where
         F: Fn(T) -> Result<(T, R), MetaError>,
@@ -742,9 +752,11 @@ impl EtcdMetaStore {
                 } else {
                     Compare::mod_revision(key, CompareOp::Equal, mod_revision)
                 };
-                let txn = Txn::new()
-                    .when([compare])
-                    .and_then([TxnOp::put(key, current, None)]);
+                let txn = Txn::new().when([compare]).and_then([TxnOp::put(
+                    key,
+                    current,
+                    options.clone(),
+                )]);
 
                 match client.txn(txn).await {
                     Ok(txn_resp) if txn_resp.succeeded() => Ok(ret),
@@ -862,6 +874,7 @@ impl EtcdMetaStore {
                 Ok((EtcdDirChildren::new(parent_ino, children), ()))
             },
             max_retries as u64,
+            &None,
         )
         .await
         .map(|_| ())
@@ -891,7 +904,9 @@ impl EtcdMetaStore {
         let sid = self
             .sid
             .get()
-            .ok_or_else(|| MetaError::Internal("sid not seted".to_string()))?;
+            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
+        let lease = *self.get_lease()?;
+        let put_options = Some(PutOptions::new().with_lease(lease));
 
         match lock_type {
             FileLockType::UnLock => {
@@ -930,6 +945,7 @@ impl EtcdMetaStore {
                     },
                     || Ok((vec![], ())), // No existing locks, nothing to unlock
                     10,
+                    &put_options,
                 )
                 .await
             }
@@ -1008,6 +1024,7 @@ impl EtcdMetaStore {
                         Ok((vec![new_plock], ()))
                     },
                     10,
+                    &put_options,
                 )
                 .await
             }
@@ -1098,6 +1115,57 @@ impl EtcdMetaStore {
         }
 
         Ok(())
+    }
+    async fn shutdown_session_by_id(&self, session_id: Uuid) -> Result<(), MetaError> {
+        let session_key = Self::etcd_session_key(Some(session_id));
+        let session_info_key = Self::etcd_session_info_key(Some(session_id));
+        let mut client = self.client.clone();
+        let txn = Txn::new().and_then(vec![
+            TxnOp::delete(session_key, None),
+            TxnOp::delete(session_info_key, None),
+        ]);
+        client
+            .txn(txn)
+            .await
+            .map_err(|err| MetaError::Internal(format!("Error shutting down session: {}", err)))?;
+        Ok(())
+    }
+    fn set_sid(&self, session_id: Uuid) -> Result<(), MetaError> {
+        self.sid
+            .set(session_id)
+            .map_err(|_| MetaError::Internal("sid has been set".to_string()))?;
+        Ok(())
+    }
+    fn get_sid(&self) -> Result<&Uuid, MetaError> {
+        self.sid
+            .get()
+            .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+    }
+    fn get_lease(&self) -> Result<&i64, MetaError> {
+        self.lease
+            .get()
+            .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+    }
+
+    async fn life_cycle(token: CancellationToken, mut keeper: LeaseKeeper) {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            select! {
+                _ = interval.tick() => {
+                    // refresh session
+                    match keeper.keep_alive().await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("Failed to refresh session: {}", err);
+                        }
+                    }
+
+                }
+                _ = token.cancelled() => {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1906,6 +1974,7 @@ impl MetaStore for EtcdMetaStore {
             },
             || Err(MetaError::NotFound(ino)),
             10,
+            &None,
         )
         .await
         .map(|_| ())
@@ -2060,6 +2129,7 @@ impl MetaStore for EtcdMetaStore {
             },
             || Ok((vec![slice], ())),
             10,
+            &None,
         )
         .await
         .map(|_| ())
@@ -2071,7 +2141,11 @@ impl MetaStore for EtcdMetaStore {
 
     // ---------- Session lifecycle implementation ----------
 
-    async fn new_session(&self, session_info: SessionInfo) -> Result<Session, MetaError> {
+    async fn start_session(
+        &self,
+        session_info: SessionInfo,
+        token: CancellationToken,
+    ) -> Result<Session, MetaError> {
         let session_id = Uuid::now_v7();
         let session_key = Self::etcd_session_key(Some(session_id));
         let session_info_key = Self::etcd_session_info_key(Some(session_id));
@@ -2082,39 +2156,34 @@ impl MetaStore for EtcdMetaStore {
             expire,
         };
 
-        self.etcd_put_json(session_key, &expire).await?;
-        self.etcd_put_json(session_info_key, &session_info).await?;
+        let mut conn = self.client.clone();
+        let lease = conn
+            .lease_grant(60 * 5, None)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to grant lease: {e}")))?;
+        let options = PutOptions::new().with_lease(lease.id());
 
+        self.etcd_put_json(session_key, &expire, Some(options.clone()))
+            .await?;
+        self.etcd_put_json(session_info_key, &session_info, Some(options.clone()))
+            .await?;
+        let (keeper, _) = conn
+            .lease_keep_alive(lease.id())
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to create lease keeper: {e}")))?;
+
+        tokio::spawn(Self::life_cycle(token, keeper));
+
+        self.set_sid(session_id)?;
+        self.lease
+            .set(lease.id())
+            .map_err(|_| MetaError::Internal("Failed to set lease".to_string()))?;
         Ok(session)
     }
 
-    async fn refresh_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let session_key = Self::etcd_session_key(Some(session_id));
-        let new_expire = (Utc::now() + Duration::minutes(5)).timestamp_millis();
-
-        self.atomic_update(
-            &session_key,
-            |_| Ok((new_expire, session_id)),
-            || Ok((new_expire, session_id)),
-            3,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn shutdown_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let session_key = Self::etcd_session_key(Some(session_id));
-        let session_info_key = Self::etcd_session_info_key(Some(session_id));
-        let mut client = self.client.clone();
-        let txn = Txn::new().and_then(vec![
-            TxnOp::delete(session_key, None),
-            TxnOp::delete(session_info_key, None),
-        ]);
-        client
-            .txn(txn)
-            .await
-            .map_err(|err| MetaError::Internal(format!("Error shutting down session: {}", err)))?;
+    async fn shutdown_session(&self) -> Result<(), MetaError> {
+        let session_id = *self.get_sid()?;
+        self.shutdown_session_by_id(session_id).await?;
         Ok(())
     }
 
@@ -2144,12 +2213,12 @@ impl MetaStore for EtcdMetaStore {
             })?;
 
             if session_value < Utc::now().timestamp_millis() {
-                self.shutdown_session(session_id).await?;
+                self.shutdown_session_by_id(session_id).await?;
             }
         }
         Ok(())
     }
-    async fn get_lock(&self, lock_name: LockName) -> bool {
+    async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let result = self
             .atomic_update::<_, _, i64, bool>(
                 &lock_name.to_string(),
@@ -2166,6 +2235,7 @@ impl MetaStore for EtcdMetaStore {
                     Ok((now, true))
                 },
                 3,
+                &None,
             )
             .await;
 
@@ -2379,7 +2449,7 @@ impl MetaStore for EtcdMetaStore {
         let sid = self
             .sid
             .get()
-            .ok_or_else(|| MetaError::Internal("sid not seted".to_string()))?;
+            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
 
         let plocks: Vec<EtcdPlock> = self.etcd_get_json(&key).await?.unwrap_or_default();
 
@@ -2427,12 +2497,6 @@ impl MetaStore for EtcdMetaStore {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    fn set_sid(&self, sid: Uuid) -> Result<(), MetaError> {
-        self.sid
-            .set(sid)
-            .map_err(|_| MetaError::Internal("sid has been seted".to_string()))
     }
 }
 
@@ -2746,7 +2810,7 @@ mod tests {
 
         // Verify lock exists
         let query = FileLockQuery {
-            owner: owner,
+            owner,
             lock_type: FileLockType::Write,
             range: FileLockRange { start: 0, end: 100 },
         };

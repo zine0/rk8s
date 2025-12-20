@@ -20,9 +20,7 @@ use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use etcd_client::{
-    Client as EtcdClient, Compare, CompareOp, GetOptions, LeaseKeeper, PutOptions, Txn, TxnOp,
-};
+use etcd_client::{Client as EtcdClient, Compare, CompareOp, LeaseKeeper, PutOptions, Txn, TxnOp};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
@@ -1144,7 +1142,7 @@ impl EtcdMetaStore {
     fn get_lease(&self) -> Result<&i64, MetaError> {
         self.lease
             .get()
-            .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+            .ok_or_else(|| MetaError::Internal("lease has not been set".to_string()))
     }
 
     async fn life_cycle(token: CancellationToken, mut keeper: LeaseKeeper) {
@@ -2187,36 +2185,9 @@ impl MetaStore for EtcdMetaStore {
         Ok(())
     }
 
+    // Etcd cleanup is performed by the lease keeper
     async fn cleanup_sessions(&self) -> Result<(), MetaError> {
-        let mut client = self.client.clone();
-        let resp = client
-            .get(
-                Self::etcd_session_key(None),
-                Some(GetOptions::new().with_prefix()),
-            )
-            .await
-            .map_err(|err| MetaError::Internal(format!("Error getting keys: {}", err)))?;
-        let sessions = resp.kvs();
-        for session in sessions {
-            let session_key = session.key_str().map_err(|err| {
-                MetaError::Internal(format!("Error deserializing key to string:{}", err))
-            })?;
-
-            let session_id = Self::get_session_id_from_session_key(session_key).ok_or(
-                MetaError::Internal(format!("Error parse session id from key: {}", session_key)),
-            )?;
-            let session_value = session.value_str().map_err(|err| {
-                MetaError::Internal(format!("Error deserializing value to string:{}", err))
-            })?;
-            let session_value: i64 = serde_json::from_str(session_value).map_err(|err| {
-                MetaError::Internal(format!("Error deserializing value to JSON:{}", err))
-            })?;
-
-            if session_value < Utc::now().timestamp_millis() {
-                self.shutdown_session_by_id(session_id).await?;
-            }
-        }
-        Ok(())
+        return Ok(());
     }
     async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let result = self

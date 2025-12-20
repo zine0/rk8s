@@ -26,6 +26,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::select;
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use uuid::Uuid;
@@ -385,7 +386,7 @@ impl RedisMetaStore {
                         let _: () = redis::pipe()
                             .atomic()
                             .hdel(&plock_key, &field)
-                            .srem(Self::locked_key(*sid), plock_key)
+                            .srem(Self::locked_key(*sid), inode)
                             .exec_async(&mut conn)
                             .await
                             .map_err(redis_err)?;
@@ -460,7 +461,7 @@ impl RedisMetaStore {
                 let _: () = redis::pipe()
                     .atomic()
                     .hset(&plock_key, &field, new_json)
-                    .sadd(Self::locked_key(*sid), plock_key)
+                    .sadd(Self::locked_key(*sid), inode)
                     .exec_async(&mut conn)
                     .await
                     .map_err(redis_err)?;
@@ -492,7 +493,8 @@ impl RedisMetaStore {
             .smembers(&locked_key)
             .await
             .map_err(|e| MetaError::Internal(format!("Failed to get locked files: {}", e)))?;
-
+        let mut pipe = redis::pipe();
+        let pipe_atomic = pipe.atomic();
         for file in locked_files {
             let owners: Vec<String> = conn
                 .hkeys(self.plock_key(file))
@@ -501,26 +503,25 @@ impl RedisMetaStore {
 
             let mut fields: Vec<String> = Vec::new();
             for owner in owners {
-                if owner.split(':').next().unwrap() == session_id_string {
+                let owner_sid = owner.split(':').next().ok_or_else(|| {
+                    MetaError::Internal(format!(
+                        "Malformed lock owner format in Redis: '{}'",
+                        owner
+                    ))
+                })?;
+                if owner_sid == session_id_string {
                     fields.push(owner);
                 }
             }
 
             if !fields.is_empty() {
-                let _: () = conn
-                    .hdel(self.plock_key(file), &fields)
-                    .await
-                    .map_err(|e| MetaError::Internal(e.to_string()))?;
+                pipe_atomic.hdel(self.plock_key(file), &fields);
             }
 
-            let _: () = conn
-                .srem(&locked_key, file)
-                .await
-                .map_err(|e| MetaError::Internal(e.to_string()))?;
+            pipe_atomic.srem(&locked_key, file);
         }
 
-        redis::pipe()
-            .atomic()
+        pipe_atomic
             .zrem(ALL_SESSIONS_KEY, &session_id_string)
             .hdel(SESSION_INFOS_KEY, &session_id_string)
             .exec_async(&mut conn)
@@ -605,6 +606,7 @@ impl RedisMetaStore {
 
     async fn life_cycle(token: CancellationToken, session_id: Uuid, conn: ConnectionManager) {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             select! {
                 _ = interval.tick() => {

@@ -1203,7 +1203,7 @@ pub struct ChunksCache {
 
     /// Cold cache tier tracking all accessed keys for pattern analysis
     /// Stores empty tuples () as lightweight metadata markers
-    cold_cache: moka::future::Cache<String, ()>,
+    cold_cache: moka::future::Cache<String, usize>,
 
     /// Intelligent promotion policy engine with adaptive thresholding
     policy: Policy,
@@ -1236,6 +1236,7 @@ impl ChunksCache {
         let hot_bytes = Arc::new(AtomicU64::new(0));
         let hot_bytes_evict = hot_bytes.clone();
         let hot_cache_builder = moka::future::Cache::builder()
+            .weigher(|_: &String, v: &Vec<u8>| v.len() as u32)
             .max_capacity(config.hot_cache_size as u64)
             .time_to_idle(Duration::from_secs(30))
             .time_to_live(Duration::from_secs(120))
@@ -1243,6 +1244,7 @@ impl ChunksCache {
                 hot_bytes_evict.fetch_sub(value.len() as u64, Ordering::Relaxed);
             });
         let cold_cache_builder = moka::future::Cache::builder()
+            .weigher(|_: &String, v: &usize| *v as u32)
             .max_capacity(config.cold_cache_size as u64)
             .time_to_idle(Duration::from_secs(30))
             .time_to_live(Duration::from_secs(120));
@@ -1311,6 +1313,7 @@ impl ChunksCache {
             }
 
             debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
+
             if policy.should_promote(key).await {
                 debug!("Promoting key to hot cache: {}", key);
                 hot_cache.insert(key.clone(), value.clone()).await;
@@ -1364,7 +1367,7 @@ impl ChunksCache {
         self.disk_storage.store(key, data).await?;
 
         trace!("Adding to cold cache: {}", key);
-        self.cold_cache.insert(key.to_owned(), ()).await;
+        self.cold_cache.insert(key.to_owned(), data.len()).await;
 
         debug!("Successfully inserted key: {}", key);
         Ok(())

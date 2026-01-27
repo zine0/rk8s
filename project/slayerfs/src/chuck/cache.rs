@@ -992,13 +992,13 @@ impl Policy {
         final_threshold
     }
 
-    async fn record_access(&self, key: String) {
+    async fn record_access(&self, key: &String) {
         trace!("Recording access for key: {}", key);
 
         // Use read lock to get or create AccessStats
         {
             let stats = self.access_stats.read().await;
-            if let Some(entry) = stats.get(&key) {
+            if let Some(entry) = stats.get(key) {
                 // If exists, directly record access (no need for write lock)
                 trace!("Found existing access stats for key: {}", key);
                 entry.record_access();
@@ -1010,7 +1010,7 @@ impl Policy {
         trace!("Creating new access stats for key: {}", key);
         let mut stats = self.access_stats.write().await;
         // Double check, prevent other threads from creating in the meantime
-        if let Some(entry) = stats.get(&key) {
+        if let Some(entry) = stats.get(key) {
             trace!("Access stats created by another thread for key: {}", key);
             entry.record_access();
         } else {
@@ -1021,11 +1021,11 @@ impl Policy {
                 self.max_entries,
             );
             entry.record_access();
-            stats.insert(key, entry);
+            stats.insert(key.clone(), entry);
         }
     }
 
-    async fn should_promote(&self, key: String) -> bool {
+    async fn should_promote(&self, key: &String) -> bool {
         // Calculate adaptive threshold
         let threshold = self.calculate_adaptive_threshold();
         trace!(
@@ -1035,7 +1035,7 @@ impl Policy {
 
         // Use read lock to check promotion conditions, reduce lock contention
         let stats = self.access_stats.read().await;
-        if let Some(entry) = stats.get(&key) {
+        if let Some(entry) = stats.get(key) {
             // Use weighted frequency from both time windows
             let weighted_frequency = entry
                 .get_weighted_access_frequency(self.short_window_weight, self.medium_window_weight);
@@ -1276,7 +1276,7 @@ impl ChunksCache {
 
     pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
         trace!("Cache GET request for key: {}", key);
-        self.policy.record_access(key.clone()).await;
+        self.policy.record_access(key).await;
 
         // Check hot cache first
         if let Some(value) = self.hot_cache.get(key).await {
@@ -1297,32 +1297,26 @@ impl ChunksCache {
         let policy = self.policy.clone();
         let hot_cache = self.hot_cache.clone();
         let hot_bytes = self.hot_bytes.clone();
-        let key_owned = key.to_string();
 
         // ensure key exists in cold cache
         self.cold_cache.get(key).await?;
 
         let load_future = async move {
-            trace!("Loading data from disk for key: {}", key_owned);
-            let value = diskstorage.load(&key_owned).await.ok().unwrap_or_default();
+            trace!("Loading data from disk for key: {}", key);
+            let value = diskstorage.load(key).await.ok().unwrap_or_default();
 
             if value.is_empty() {
-                warn!("No data found on disk for key: {}", key_owned);
+                warn!("No data found on disk for key: {}", key);
                 return value;
             }
 
-            debug!(
-                "Loaded {} bytes from disk for key: {}",
-                value.len(),
-                key_owned
-            );
-
-            if policy.should_promote(key_owned.clone()).await {
-                debug!("Promoting key to hot cache: {}", key_owned);
-                hot_cache.insert(key_owned.clone(), value.clone()).await;
+            debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
+            if policy.should_promote(key).await {
+                debug!("Promoting key to hot cache: {}", key);
+                hot_cache.insert(key.clone(), value.clone()).await;
                 hot_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
             } else {
-                trace!("Key not eligible for promotion: {}", key_owned);
+                trace!("Key not eligible for promotion: {}", key);
             }
 
             value
@@ -1752,11 +1746,11 @@ mod tests {
         let key = "test_key".to_string();
 
         // Should not promote initially
-        assert!(!policy.should_promote(key.clone()).await);
+        assert!(!policy.should_promote(&key).await);
 
         // Record multiple accesses
         for _ in 0..10 {
-            policy.record_access(key.clone()).await;
+            policy.record_access(&key).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -1767,11 +1761,11 @@ mod tests {
         // Note: due to bucket implementation, more accesses may be required
         let additional_accesses = 50;
         for _ in 0..additional_accesses {
-            policy.record_access(key.clone()).await;
+            policy.record_access(&key).await;
         }
 
         // Check whether promotion conditions are met
-        let should_promote = policy.should_promote(key.clone()).await;
+        let should_promote = policy.should_promote(&key).await;
         // If the frequency is high enough, promotion should occur
         if should_promote {
             println!("Key promoted successfully");

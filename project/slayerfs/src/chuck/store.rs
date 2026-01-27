@@ -372,7 +372,7 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
         if copy_end > start {
             buf[..(copy_end - start)].copy_from_slice(&block[start..copy_end]);
         }
-        
+
         let block_cache = self.block_cache.clone();
         tokio::spawn(async move {
             let _ = block_cache.insert(&cache_key, &block).await;

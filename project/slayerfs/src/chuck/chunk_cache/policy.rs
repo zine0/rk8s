@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,332 +15,6 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
-/// Configuration for the intelligent dual-layer cache system.
-///
-/// This cache implements an adaptive promotion strategy that combines:
-/// - **Dual time windows** for burst detection and trend analysis
-/// - **Dynamic threshold adjustment** based on system metrics
-/// - **Weighted frequency calculation** for intelligent promotion decisions
-///
-/// # Architecture Overview
-///
-/// ```text
-/// +-----------------+    +-----------------+    +-----------------+
-/// |   Hot Cache     |    |   Cold Cache    |    |  Disk Storage   |
-/// |   (1024 items)  |<-->|   (1024 items)  |<-->|   (Persistent)  |
-/// |   Fast Access   |    |   Metadata Only |    |   SHA256 Files  |
-/// +-----------------+    +-----------------+    +-----------------+
-///         ^                       |                       ^
-///         |                       |                       |
-///         v                       v                       v
-///    Adaptive Promotion     Access Pattern Tracking    Fallback Storage
-///    Strategy Engine        & Frequency Analysis       for Large Data
-/// ```
-///
-/// # Promotion Strategy Details
-///
-/// The promotion decision uses a multi-dimensional scoring system:
-///
-/// ```text
-/// weighted_frequency = short_freq * short_weight + medium_freq * medium_weight
-/// adaptive_threshold = base_threshold * system_factor * hitrate_factor
-/// promote_if = weighted_frequency >= adaptive_threshold
-/// ```
-///
-/// ## Time Windows
-///
-/// - **Short Window (10s)**: Detects burst access patterns with 1-second granularity
-/// - **Medium Window (60s)**: Analyzes medium-term trends with 5-second granularity
-///
-/// ## Adaptive Threshold Logic
-///
-/// - **High Load** (>0.8): Reduce threshold by 30% for aggressive promotion
-/// - **Low Hit Rate** (<0.6): Increase threshold by 30% to prevent cache pollution
-/// - **High Hit Rate** (>0.8): Reduce threshold by 10% to maintain performance
-///
-/// # Example Configurations
-///
-/// ## Performance-Optimized (Low Latency)
-/// ```text
-/// ChunksCacheConfig {
-///     base_promotion_threshold: 5.0,
-///     short_window_weight: 0.8,
-///     enable_adaptive_threshold: true,
-///     // ... other settings
-/// }
-/// ```
-///
-/// ## Memory-Conservative (Resource Constrained)
-/// ```text
-/// ChunksCacheConfig {
-///     base_promotion_threshold: 15.0,
-///     short_window_weight: 0.6,
-///     conservative_promotion_hit_rate_threshold: 0.7,
-///     // ... other settings
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct ChunksCacheConfig {
-    /// Maximum number of entries in hot cache (fastest access tier)
-    ///
-    /// **Recommended**: 512-2048 depending on available memory
-    /// **Impact**: Higher values = more hot data but more memory usage
-    pub hot_cache_size: usize,
-
-    /// Maximum number of entries in cold cache (metadata tracking tier)
-    ///
-    /// **Recommended**: Same as hot_cache_size or 2x for comprehensive tracking
-    /// **Impact**: Higher values = better access pattern visibility but more metadata overhead
-    pub cold_cache_size: usize,
-
-    /// Base access frequency threshold for promoting items to hot cache
-    ///
-    /// **Units**: accesses per second
-    /// **Typical Range**: 5.0 - 20.0
-    /// **Lower Values**: More aggressive promotion (better for bursty workloads)
-    /// **Higher Values**: More conservative (better for stable workloads)
-    pub base_promotion_threshold: f64,
-
-    /// Short time window for burst access detection
-    ///
-    /// **Purpose**: Capture rapid, recent access patterns
-    /// **Recommended**: 5-15 seconds
-    /// **Trade-off**: Shorter = more responsive but noisier
-    pub short_window_size: Duration,
-
-    /// Medium time window for trend analysis
-    ///
-    /// **Purpose**: Identify sustained access patterns and trends
-    /// **Recommended**: 30-120 seconds
-    /// **Trade-off**: Longer = more stable but slower to adapt
-    pub medium_window_size: Duration,
-
-    /// Maximum number of access records to keep per key
-    ///
-    /// **Note**: Legacy parameter for compatibility. Actual bucket count is
-    ///         calculated dynamically based on window sizes.
-    pub max_access_entries: usize,
-
-    /// Custom disk storage directory (optional)
-    ///
-    /// If None, uses system cache directory via `dirs::cache_dir()`
-    /// Files are stored using SHA256 hash of the key for unique naming
-    pub disk_storage_dir: Option<PathBuf>,
-
-    /// Weight for short window access frequency in promotion decisions
-    ///
-    /// **Range**: 0.0 - 1.0
-    /// **Higher Values**: Prioritize recent burst access (good for interactive workloads)
-    /// **Lower Values**: Prioritize sustained trends (good for batch workloads)
-    pub short_window_weight: f64,
-
-    /// Weight for medium window access frequency in promotion decisions
-    ///
-    /// **Range**: 0.0 - 1.0
-    /// **Note**: short_window_weight + medium_window_weight should typically sum to 1.0
-    pub medium_window_weight: f64,
-
-    /// Enable adaptive threshold adjustment based on system load and hit rate
-    ///
-    /// **When true**: Dynamically adjusts promotion threshold based on:
-    ///   - System load (cache utilization + request rate)
-    ///   - Cache hit rate
-    ///
-    /// **When false**: Uses fixed base_promotion_threshold
-    pub enable_adaptive_threshold: bool,
-
-    /// System load threshold for triggering aggressive promotion mode
-    ///
-    /// **Range**: 0.0 - 1.0
-    /// **When exceeded**: Reduces promotion threshold by 30% to cache more data
-    /// **Purpose**: Improve performance under high load by increasing cache hit rate
-    pub aggressive_promotion_load_threshold: f64,
-
-    /// Cache hit rate threshold for triggering conservative promotion mode
-    ///
-    /// **Range**: 0.0 - 1.0
-    /// **When below**: Increases promotion threshold by 30% to prevent cache pollution
-    /// **Purpose**: Maintain cache efficiency when hit rate is already low
-    pub conservative_promotion_hit_rate_threshold: f64,
-}
-
-impl Default for ChunksCacheConfig {
-    fn default() -> Self {
-        Self {
-            hot_cache_size: 1024,
-            cold_cache_size: 1024,
-            base_promotion_threshold: 10.0,
-            short_window_size: Duration::from_secs(10),
-            medium_window_size: Duration::from_secs(60),
-            max_access_entries: 100,
-            disk_storage_dir: None,
-            short_window_weight: 0.7,
-            medium_window_weight: 0.3,
-            enable_adaptive_threshold: true,
-            aggressive_promotion_load_threshold: 0.8,
-            conservative_promotion_hit_rate_threshold: 0.6,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DiskStorage {
-    base_dir: PathBuf,
-}
-
-impl DiskStorage {
-    pub async fn new<P: AsRef<Path>>(base_dir: P) -> anyhow::Result<Self> {
-        let base_dir = base_dir.as_ref().to_path_buf();
-        debug!("Initializing disk storage at: {:?}", base_dir);
-
-        if !base_dir.exists() {
-            info!("Creating cache directory: {:?}", base_dir);
-            fs::create_dir_all(&base_dir).await?;
-        } else {
-            debug!("Cache directory already exists: {:?}", base_dir);
-        }
-
-        Ok(Self { base_dir })
-    }
-
-    pub fn key_to_filename(key: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        let hash_result = hasher.finalize();
-
-        hex::encode(hash_result)
-    }
-
-    pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
-        let filename = Self::key_to_filename(key);
-        let filepath = self.base_dir.join(filename);
-        let data_bytes = data.as_ref();
-
-        trace!(
-            "Storing {} bytes for key '{}' to file: {:?}",
-            data_bytes.len(),
-            key,
-            filepath
-        );
-
-        tokio::fs::write(filepath, data_bytes).await?;
-        debug!(
-            "Successfully stored data for key '{}', size: {} bytes",
-            key,
-            data_bytes.len()
-        );
-        Ok(())
-    }
-
-    pub async fn load(&self, key: &str) -> anyhow::Result<Vec<u8>> {
-        let filename = Self::key_to_filename(key);
-        let filepath = self.base_dir.join(filename);
-
-        trace!("Loading data for key '{}' from file: {:?}", key, filepath);
-
-        if !filepath.exists() {
-            trace!("File does not exist for key '{}': {:?}", key, filepath);
-            return Err(anyhow!("file {} does not exist", filepath.display()));
-        }
-
-        match tokio::fs::read(filepath).await {
-            Ok(data) => {
-                debug!(
-                    "Successfully loaded data for key '{}', size: {} bytes",
-                    key,
-                    data.len()
-                );
-                Ok(data)
-            }
-            Err(e) => {
-                error!("Failed to load data for key '{}': {}", key, e);
-                Err(e.into())
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn remove(&self, key: &str) -> anyhow::Result<()> {
-        let filename = Self::key_to_filename(key);
-        let filepath = self.base_dir.join(filename);
-
-        trace!("Removing file for key '{}': {:?}", key, filepath);
-
-        if !filepath.exists() {
-            warn!(
-                "Attempted to remove non-existent file for key '{}': {:?}",
-                key, filepath
-            );
-            return Err(anyhow!("file {} does not exist", filepath.display()));
-        }
-
-        match tokio::fs::remove_file(filepath).await {
-            Ok(_) => {
-                debug!("Successfully removed file for key '{}'", key);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to remove file for key '{}': {}", key, e);
-                Err(e.into())
-            }
-        }
-    }
-}
-
-/// Lock-free access statistics tracker with dual time window analysis.
-///
-/// This structure implements a high-performance, concurrent-safe access pattern
-/// analysis system using atomic operations and circular time buckets.
-///
-/// # Architecture
-///
-/// ```text
-/// Time Progress ----------------------------------------------->
-///
-/// Short Window (10s, 1s granularity):
-/// +--+--+--+--+--+--+--+--+--+--+
-/// |0 |1 |2 |3 |4 |5 |6 |7 |8 |9 |
-/// +--+--+--+--+--+--+--+--+--+--+
-///  |                            |
-///  v                            v
-/// Old Data                  Recent Data
-///
-/// Medium Window (60s, 5s granularity):
-/// +---+---+---+---+---+---+---+---+---+---+---+---+
-/// | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |10 |11 |
-/// +---+---+---+---+---+---+---+---+---+---+---+---+
-///  0-5s  5-10s                     55-60s
-/// ```
-///
-/// # Performance Characteristics
-///
-/// - **O(1) access recording**: Single atomic increment per access
-/// - **Lock-free design**: No mutexes or RwLocks
-/// - **Memory efficient**: Circular buffer with automatic cleanup
-/// - **Cache-friendly**: Sequential memory layout
-///
-/// # Usage Examples
-///
-/// ```ignore
-/// use std::time::Duration;
-///
-/// let stats = AccessStats::new(
-///     Duration::from_secs(10),  // Short window
-///     Duration::from_secs(60),  // Medium window
-///     100,                      // Legacy compat parameter
-/// );
-///
-/// // Record an access (thread-safe, O(1))
-/// stats.record_access();
-///
-/// // Calculate weighted frequency
-/// let weighted = stats.get_weighted_access_frequency(0.7, 0.3);
-/// ```
-///
-/// # Thread Safety
-///
-/// This struct is designed for concurrent access from multiple threads.
-/// All operations use atomic primitives and are completely lock-free.
 #[derive(Debug)]
 struct AccessStats {
     /// Short window buckets for burst access detection
@@ -866,7 +538,7 @@ impl SystemMetrics {
 /// This struct uses `Arc<RwLock<>>` for access stats and `Arc<>` for system metrics,
 /// allowing safe concurrent access from multiple threads while maintaining consistency.
 #[derive(Debug, Clone)]
-struct Policy {
+pub struct Policy {
     /// Per-key access statistics with dual time window analysis
     ///
     /// Stores `AccessStats` for each cache key, tracking both short-term burst
@@ -909,7 +581,7 @@ struct Policy {
 
 impl Policy {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         short_window_size: Duration,
         medium_window_size: Duration,
         max_entries: usize,
@@ -992,7 +664,7 @@ impl Policy {
         final_threshold
     }
 
-    async fn record_access(&self, key: &String) {
+    pub async fn record_access(&self, key: &String) {
         trace!("Recording access for key: {}", key);
 
         // Use read lock to get or create AccessStats
@@ -1025,7 +697,7 @@ impl Policy {
         }
     }
 
-    async fn should_promote(&self, key: &String) -> bool {
+    pub async fn should_promote(&self, key: &String) -> bool {
         // Calculate adaptive threshold
         let threshold = self.calculate_adaptive_threshold();
         trace!(
@@ -1054,13 +726,13 @@ impl Policy {
     }
 
     /// Record cache request for metrics tracking
-    fn record_cache_request(&self, hit: bool) {
+    pub fn record_cache_request(&self, hit: bool) {
         trace!("Recording cache request: hit={}", hit);
         self.system_metrics.record_request(hit);
     }
 
     /// Update cache utilization metrics
-    fn update_cache_utilization(&self, current_size: u64, max_size: u64) {
+    pub fn update_cache_utilization(&self, current_size: u64, max_size: u64) {
         let utilization = if max_size > 0 {
             current_size as f64 / max_size as f64
         } else {
@@ -1093,307 +765,16 @@ impl Policy {
     }
 }
 
-/// High-performance adaptive dual-layer cache system.
-///
-/// This cache implements a sophisticated three-tier storage architecture with intelligent
-/// promotion strategies based on access patterns and system performance metrics.
-///
-/// # Architecture Tiers
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────┐
-/// │                    Request Flow                              │
-/// ├─────────────────────────────────────────────────────────────┤
-/// │ 1. Hot Cache (Memory)     ← Fastest, O(1) lookup            │
-/// │    - Size: 1024 items      - Stores actual data             │
-/// │    - TTL: 120s            - For frequently accessed items   │
-/// │    - TTI: 30s             - Adaptive promotion based on     │
-/// │                           - access frequency & system load  │
-/// │                                                             │
-/// │ 2. Cold Cache (Memory)     ← Fast, O(1) metadata lookup     │
-/// │    - Size: 1024 items      - Tracks all accessed keys       │
-/// │    - TTL: 120s            - Enables access pattern analysis │
-/// │    - TTI: 30s             - Lightweight key tracking        │
-/// │                                                             │
-/// │ 3. Disk Storage (SSD/HDD)  ← Slower, but persistent        │
-/// │    - Unlimited size       - SHA256-based file naming       │
-/// │    - System cache dir     - Fallback for all data           │
-/// │    - Async I/O            - Handles large files efficiently │
-/// └─────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// # Promotion Strategy
-///
-/// The cache uses an intelligent promotion algorithm that considers:
-///
-/// 1. **Dual Time Windows**: Short-term (10s) and medium-term (60s) access patterns
-/// 2. **Weighted Frequency**: Combines burst detection with trend analysis
-/// 3. **Adaptive Thresholding**: Adjusts based on system load and hit rates
-/// 4. **System Metrics**: Real-time performance feedback
-///
-/// # Performance Characteristics
-///
-/// - **Hot Cache Hit**: ~50ns (memory access)
-/// - **Cold Cache Hit + Promotion**: ~1-10μs (memory + disk I/O)
-/// - **Cold Cache Miss + Disk Load**: ~1-10ms (disk I/O)
-/// - **Concurrent Access**: Lock-free for reads, minimal contention for writes
-///
-/// # Usage Examples
-///
-/// ## Basic Usage
-/// ```ignore
-/// # use slayerfs::chuck::cache::ChunksCache;
-/// # async fn demo() -> anyhow::Result<()> {
-/// let cache = ChunksCache::new().await?;
-/// cache.insert("key1", &data).await?;
-/// let value = cache.get(&"key1".to_string()).await?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// ## Custom Configuration
-/// ```ignore
-/// let config = ChunksCacheConfig {
-///     base_promotion_threshold: 5.0,        // More aggressive
-///     short_window_weight: 0.8,            // Prioritize bursts
-///     enable_adaptive_threshold: true,      // Enable adaptation
-///     ..Default::default()
-/// };
-/// let cache = ChunksCache::new_with_config(config).await?;
-/// ```
-///
-/// ## Performance-Tuned Configuration
-/// ```ignore
-/// use std::time::Duration;
-///
-/// let config = ChunksCacheConfig {
-///     hot_cache_size: 2048,                 // Larger hot cache
-///     base_promotion_threshold: 3.0,        // Very aggressive
-///     short_window_size: Duration::from_secs(5),   // Faster response
-///     short_window_weight: 0.9,            // Heavily prefer bursts
-///     aggressive_promotion_load_threshold: 0.6,    // Earlier aggression
-///     ..Default::default()
-/// };
-/// ```
-///
-/// # Thread Safety
-///
-/// This cache is fully thread-safe and designed for high-concurrency environments:
-/// - All operations are async and non-blocking
-/// - Access statistics use lock-free atomic operations
-/// - Cache operations use Moka's concurrent-safe implementation
-///
-/// # Memory Management
-///
-/// - **Hot Cache**: Stores actual data, limited by `hot_cache_size`
-/// - **Cold Cache**: Stores only `()` markers, minimal memory overhead
-/// - **Access Stats**: Per-key statistics, automatically cleaned up when idle
-/// - **Disk Storage**: Uses system temp directory, respects available space
-#[derive(Clone)]
-pub struct ChunksCache {
-    /// Persistent disk storage backend with SHA256-based file naming
-    disk_storage: DiskStorage,
-
-    /// Hot cache tier storing frequently accessed data in memory
-    /// Uses Moka's high-performance concurrent cache implementation
-    hot_cache: moka::future::Cache<String, Vec<u8>>,
-
-    /// Approximate hot cache bytes (sum of Vec<u8> lengths)
-    hot_bytes: Arc<AtomicU64>,
-
-    /// Cold cache tier tracking all accessed keys for pattern analysis
-    /// Stores empty tuples () as lightweight metadata markers
-    cold_cache: moka::future::Cache<String, usize>,
-
-    /// Intelligent promotion policy engine with adaptive thresholding
-    policy: Policy,
-
-    /// Cache configuration parameters (stored for runtime adjustments)
-    config: ChunksCacheConfig,
-}
-
-impl ChunksCache {
-    /// Creates a new ChunksCache with default configuration
-    #[allow(dead_code)]
-    pub async fn new() -> anyhow::Result<Self> {
-        Self::new_with_config(ChunksCacheConfig::default()).await
-    }
-
-    /// Creates a new ChunksCache with custom configuration
-    pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
-        info!(
-            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
-            config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
-        );
-
-        let cache_dir = config
-            .disk_storage_dir
-            .take()
-            .unwrap_or_else(|| cache_dir().unwrap());
-        debug!("Using cache directory: {:?}", cache_dir);
-        let disk_storage = DiskStorage::new(cache_dir).await?;
-
-        let hot_bytes = Arc::new(AtomicU64::new(0));
-        let hot_bytes_evict = hot_bytes.clone();
-        let hot_cache_builder = moka::future::Cache::builder()
-            .weigher(|_: &String, v: &Vec<u8>| v.len() as u32)
-            .max_capacity(config.hot_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120))
-            .eviction_listener(move |_key, value: Vec<u8>, _cause| {
-                hot_bytes_evict.fetch_sub(value.len() as u64, Ordering::Relaxed);
-            });
-        let cold_cache_builder = moka::future::Cache::builder()
-            .weigher(|_: &String, v: &usize| *v as u32)
-            .max_capacity(config.cold_cache_size as u64)
-            .time_to_idle(Duration::from_secs(30))
-            .time_to_live(Duration::from_secs(120));
-
-        debug!(
-            "Creating policy with adaptive threshold: {}",
-            config.enable_adaptive_threshold
-        );
-        let policy = Policy::new(
-            config.short_window_size,
-            config.medium_window_size,
-            config.max_access_entries,
-            config.base_promotion_threshold,
-            config.short_window_weight,
-            config.medium_window_weight,
-            config.enable_adaptive_threshold,
-            config.aggressive_promotion_load_threshold,
-            config.conservative_promotion_hit_rate_threshold,
-        );
-
-        info!("ChunksCache created successfully");
-        Ok(Self {
-            disk_storage,
-            hot_cache: hot_cache_builder.build(),
-            hot_bytes,
-            cold_cache: cold_cache_builder.build(),
-            policy,
-            config,
-        })
-    }
-
-    pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
-        trace!("Cache GET request for key: {}", key);
-        self.policy.record_access(key).await;
-
-        // Check hot cache first
-        if let Some(value) = self.hot_cache.get(key).await {
-            debug!(
-                "Hot cache HIT for key: {}, size: {} bytes",
-                key,
-                value.len()
-            );
-            self.policy.record_cache_request(true);
-            self.update_utilization_metrics();
-            return Some(value);
-        }
-
-        debug!("Hot cache MISS for key: {}", key);
-        self.policy.record_cache_request(false);
-
-        let diskstorage = self.disk_storage.clone();
-        let policy = self.policy.clone();
-        let hot_cache = self.hot_cache.clone();
-        let hot_bytes = self.hot_bytes.clone();
-
-        // ensure key exists in cold cache
-        self.cold_cache.get(key).await?;
-
-        let load_future = async move {
-            trace!("Loading data from disk for key: {}", key);
-            let value = diskstorage.load(key).await.ok().unwrap_or_default();
-
-            if value.is_empty() {
-                warn!("No data found on disk for key: {}", key);
-                return value;
-            }
-
-            debug!("Loaded {} bytes from disk for key: {}", value.len(), key);
-
-            if policy.should_promote(key).await {
-                debug!("Promoting key to hot cache: {}", key);
-                hot_cache.insert(key.clone(), value.clone()).await;
-                hot_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
-            } else {
-                trace!("Key not eligible for promotion: {}", key);
-            }
-
-            value
-        };
-
-        let value = self.hot_cache.get_with_by_ref(key, load_future).await;
-
-        self.update_utilization_metrics();
-
-        if value.is_empty() {
-            debug!("No data found for key: {}", key);
-            None
-        } else {
-            debug!("Returning {} bytes for key: {}", value.len(), key);
-            value.into()
-        }
-    }
-
-    /// Update cache utilization metrics
-    fn update_utilization_metrics(&self) {
-        let current_size = self.hot_cache.entry_count();
-        let max_size = self.config.hot_cache_size as u64;
-        let bytes = self.hot_bytes.load(Ordering::Relaxed);
-        trace!(
-            "Updating cache utilization: {}/{} entries, {} MB hot bytes",
-            current_size,
-            max_size,
-            bytes / 1024 / 1024
-        );
-        self.policy.update_cache_utilization(current_size, max_size);
-    }
-
-    pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
-        info!(
-            "Cache INSERT request for key: {}, size: {} bytes",
-            key,
-            data.len()
-        );
-        trace!("Inserting into hot cache: {}", key);
-        self.hot_cache.insert(key.to_owned(), data.clone()).await;
-        self.hot_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-        trace!("Storing on disk: {}", key);
-        self.disk_storage.store(key, data).await?;
-
-        trace!("Adding to cold cache: {}", key);
-        self.cold_cache.insert(key.to_owned(), data.len()).await;
-
-        debug!("Successfully inserted key: {}", key);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn remove(&self, key: &String) -> anyhow::Result<()> {
-        info!("Cache REMOVE request for key: {}", key);
-        trace!("Invalidating from hot cache: {}", key);
-        self.hot_cache.invalidate(key).await;
-        // self.disk_storage.remove(key).await?;
-        trace!("Invalidating from cold cache: {}", key);
-        self.cold_cache.invalidate(key).await;
-
-        debug!("Successfully removed key: {}", key);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio;
+
+    use crate::chuck::chunk_cache::disk_storage::*;
+    use crate::chuck::chunk_cache::policy::*;
+    use crate::chuck::chunk_cache::*;
 
     // Test helper: create a temporary storage directory
     async fn setup_test_storage() -> (DiskStorage, tempfile::TempDir) {

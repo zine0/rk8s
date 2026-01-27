@@ -14,8 +14,8 @@
 
 #![allow(unused_imports)]
 
-pub mod cache;
 pub mod chunk;
+mod chunk_cache;
 pub mod reader;
 pub mod slice;
 pub mod span;
@@ -26,6 +26,7 @@ pub mod writer;
 pub use chunk::{
     ChunkLayout, DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE, chunk_index_of, within_chunk_offset,
 };
+pub use chunk_cache::{ChunksCache, ChunksCacheConfig};
 pub use slice::{BlockSpan, SliceDesc};
 pub use span::{BlockTag, ChunkTag, PageTag, Span, SpanTag};
 pub use store::{BlockStore, InMemoryBlockStore, ObjectBlockStore, S3BlockStore};

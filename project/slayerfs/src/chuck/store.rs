@@ -3,7 +3,7 @@
 use crate::utils::zero::make_zero_bytes;
 use crate::{
     cadapter::client::{ObjectBackend, ObjectClient},
-    chuck::cache::{ChunksCache, ChunksCacheConfig},
+    chuck::chunk_cache::{ChunksCache, ChunksCacheConfig},
 };
 use anyhow::{self, Context};
 use async_trait::async_trait;

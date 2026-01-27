@@ -1189,6 +1189,7 @@ impl Policy {
 /// - **Cold Cache**: Stores only `()` markers, minimal memory overhead
 /// - **Access Stats**: Per-key statistics, automatically cleaned up when idle
 /// - **Disk Storage**: Uses system temp directory, respects available space
+#[derive(Clone)]
 pub struct ChunksCache {
     /// Persistent disk storage backend with SHA256-based file naming
     disk_storage: DiskStorage,

@@ -34,13 +34,265 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
 
 /// ID allocation batch size
 /// TODO: make configurable.
 const BATCH_SIZE: i64 = 1000;
 const FIRST_ALLOCATED_ID: i64 = 2;
+
+#[allow(dead_code)]
+enum UpdateAction {
+    Write(Vec<u8>),
+    Delete,
+    Skip,
+}
+
+struct UpdatePlan {
+    key: String,
+    compare: Compare,
+    action: UpdateAction,
+}
+
+impl UpdatePlan {
+    fn new_write(
+        ctx: &TxnContext,
+        key: impl Into<String>,
+        value: Vec<u8>,
+    ) -> Result<Self, MetaError> {
+        let key = key.into();
+        let compare = ctx.compare_for(&key)?;
+        Ok(Self {
+            key,
+            compare,
+            action: UpdateAction::Write(value),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn new_delete(ctx: &TxnContext, key: impl Into<String>) -> Result<Self, MetaError> {
+        let key = key.into();
+        let compare = ctx.compare_for(&key)?;
+        Ok(Self {
+            key,
+            compare,
+            action: UpdateAction::Delete,
+        })
+    }
+}
+
+trait TxnStage: Send + Sync {
+    fn deps(&self) -> &[String];
+
+    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError>;
+}
+
+struct TxnStageFn<F> {
+    deps: Vec<String>,
+    f: F,
+}
+
+impl<F> TxnStage for TxnStageFn<F>
+where
+    F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync,
+{
+    fn deps(&self) -> &[String] {
+        self.deps.as_slice()
+    }
+
+    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError> {
+        (self.f)(ctx)
+    }
+}
+
+struct TxnEntry {
+    value: Option<Vec<u8>>,
+    mod_revision: i64,
+}
+
+struct TxnContext {
+    slots: HashMap<String, TxnEntry>,
+}
+
+impl TxnContext {
+    fn compare_for(&self, key: &str) -> Result<Compare, MetaError> {
+        let Some(entry) = self.slots.get(key) else {
+            return Err(MetaError::Internal(format!(
+                "Missing key in transaction context: {key}"
+            )));
+        };
+
+        if entry.mod_revision == 0 {
+            Ok(Compare::version(key, CompareOp::Equal, 0))
+        } else {
+            Ok(Compare::mod_revision(
+                key,
+                CompareOp::Equal,
+                entry.mod_revision,
+            ))
+        }
+    }
+
+    fn value(&self, key: &str) -> Option<&[u8]> {
+        self.slots.get(key).and_then(|entry| entry.value.as_deref())
+    }
+
+    async fn fetch(client: &mut EtcdClient, keys: &[String]) -> Result<Self, MetaError> {
+        if keys.is_empty() {
+            return Ok(Self {
+                slots: HashMap::new(),
+            });
+        }
+
+        let ops: Vec<TxnOp> = keys
+            .iter()
+            .map(|key| TxnOp::get(key.as_bytes(), None))
+            .collect();
+
+        let txn = Txn::new().and_then(ops);
+        let resp = client
+            .txn(txn)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Etcd txn fetch error: {e}")))?;
+
+        let mut slots = HashMap::with_capacity(keys.len());
+
+        // Etcd preserves response order for each request op in the txn success list.
+        let responses = resp.op_responses();
+
+        for (idx, key) in keys.iter().enumerate() {
+            let entry = match responses.get(idx) {
+                Some(TxnOpResponse::Get(range_resp)) => range_resp
+                    .kvs()
+                    .first()
+                    .map(|kv| TxnEntry {
+                        value: Some(kv.value().to_vec()),
+                        mod_revision: kv.mod_revision(),
+                    })
+                    .unwrap_or(TxnEntry {
+                        value: None,
+                        mod_revision: 0,
+                    }),
+                Some(_) => {
+                    return Err(MetaError::Internal(format!(
+                        "Unexpected txn response for key {key}"
+                    )));
+                }
+                None => {
+                    return Err(MetaError::Internal(format!(
+                        "Missing txn response for key {key}"
+                    )));
+                }
+            };
+            slots.insert(key.clone(), entry);
+        }
+
+        Ok(Self { slots })
+    }
+}
+
+struct TxnBuilder {
+    stages: Vec<Box<dyn TxnStage>>,
+}
+
+impl TxnBuilder {
+    fn new() -> Self {
+        Self { stages: Vec::new() }
+    }
+
+    fn add_stage<F>(&mut self, deps: Vec<String>, stage: F)
+    where
+        F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync + 'static,
+    {
+        self.stages.push(Box::new(TxnStageFn { deps, f: stage }));
+    }
+
+    fn deps(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut deps = Vec::new();
+
+        for stage in &self.stages {
+            for key in stage.deps() {
+                if seen.insert(key.clone()) {
+                    deps.push(key.clone());
+                }
+            }
+        }
+        deps
+    }
+
+    async fn execute(&self, client: &EtcdClient, max_retries: u64) -> Result<(), MetaError> {
+        let deps = self.deps();
+        let stages = &self.stages;
+        let client = client.clone();
+
+        let attempt = || {
+            let deps = deps.clone();
+            let mut client = client.clone();
+
+            async move {
+                let ctx = TxnContext::fetch(&mut client, &deps).await?;
+                let mut plans = Vec::new();
+                for stage in stages {
+                    plans.extend(stage.build(&ctx)?);
+                }
+
+                if plans.is_empty() {
+                    return Ok(());
+                }
+
+                let mut compares = Vec::new();
+                let mut ops = Vec::new();
+                let mut seen_keys = std::collections::HashSet::new();
+
+                for plan in plans {
+                    if !ctx.slots.contains_key(&plan.key) {
+                        return Err(MetaError::Internal(format!(
+                            "Stage generated plan for undeclared key: {}",
+                            plan.key
+                        )));
+                    }
+
+                    if !seen_keys.insert(plan.key.clone()) {
+                        return Err(MetaError::Internal(format!(
+                            "Duplicate update plan for key {}",
+                            plan.key
+                        )));
+                    }
+
+                    match plan.action {
+                        UpdateAction::Skip => continue,
+                        UpdateAction::Write(value) => {
+                            compares.push(plan.compare);
+                            ops.push(TxnOp::put(plan.key, value, None));
+                        }
+                        UpdateAction::Delete => {
+                            compares.push(plan.compare);
+                            ops.push(TxnOp::delete(plan.key, None));
+                        }
+                    }
+                }
+
+                if ops.is_empty() {
+                    return Ok(());
+                }
+
+                let txn = Txn::new().when(compares).and_then(ops);
+
+                match client.txn(txn).await {
+                    Ok(resp) if resp.succeeded() => Ok(()),
+                    Ok(_) => Err(MetaError::ContinueRetry),
+                    Err(e) => Err(MetaError::Internal(format!(
+                        "Failed to execute transaction: {e}"
+                    ))),
+                }
+            }
+        };
+
+        backoff(max_retries, attempt).await
+    }
+}
 
 /// Etcd-based metadata store
 pub struct EtcdMetaStore {
@@ -1255,6 +1507,7 @@ impl MetaStore for EtcdMetaStore {
         "etcd"
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         // Query reverse index once to get all metadata
         let reverse_key = Self::etcd_reverse_key(ino);
@@ -1270,6 +1523,11 @@ impl MetaStore for EtcdMetaStore {
 
     /// Batch stat implementation for Etcd using Transaction batch GET
     /// Uses single transaction to fetch multiple keys - much faster than sequential queries
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, inodes),
+        fields(inode_count = inodes.len())
+    )]
     async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
         if inodes.is_empty() {
             return Ok(Vec::new());
@@ -1299,6 +1557,7 @@ impl MetaStore for EtcdMetaStore {
                 .await
                 .map_err(|e| MetaError::Internal(format!("Etcd batch txn error: {}", e)))?;
 
+            // Etcd preserves response order for each request op in the txn success list.
             let responses = txn_response.op_responses();
 
             // Parse responses - one response per inode
@@ -1342,6 +1601,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(results)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let forward_key = Self::etcd_forward_key(parent, name);
         if let Some(entry) = self.etcd_get_json::<EtcdForwardEntry>(&forward_key).await? {
@@ -1351,6 +1611,7 @@ impl MetaStore for EtcdMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(path))]
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path == "/" {
             return Ok(Some((1, FileType::Dir)));
@@ -1398,6 +1659,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(Some((current_inode, FileType::Dir)))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let access_meta = self
             .get_access_meta(ino)
@@ -1431,10 +1693,12 @@ impl MetaStore for EtcdMetaStore {
         Ok(entries)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_directory(parent, name).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let forward_key = Self::etcd_forward_key(parent, name);
         let forward_entry: EtcdForwardEntry =
@@ -1523,10 +1787,12 @@ impl MetaStore for EtcdMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_file_internal(parent, name).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, parent, name))]
     async fn link(&self, ino: i64, parent: i64, name: &str) -> Result<FileAttr, MetaError> {
         if ino == 1 {
             return Err(MetaError::NotSupported(
@@ -1753,6 +2019,7 @@ impl MetaStore for EtcdMetaStore {
         self.stat(ino).await?.ok_or(MetaError::NotFound(ino))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name, target))]
     async fn symlink(
         &self,
         parent: i64,
@@ -1860,6 +2127,7 @@ impl MetaStore for EtcdMetaStore {
         Ok((inode, attr))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
         let reverse_key = Self::etcd_reverse_key(ino);
         let entry_info = self
@@ -1876,6 +2144,7 @@ impl MetaStore for EtcdMetaStore {
             .ok_or_else(|| MetaError::NotSupported(format!("inode {ino} is not a symbolic link")))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let mut client = self.client.clone();
 
@@ -2058,6 +2327,11 @@ impl MetaStore for EtcdMetaStore {
         }
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(old_parent, old_name, new_parent, new_name)
+    )]
     async fn rename(
         &self,
         old_parent: i64,
@@ -2373,6 +2647,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size))]
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let reverse_key = Self::etcd_reverse_key(ino);
         self.atomic_update(
@@ -2423,6 +2698,7 @@ impl MetaStore for EtcdMetaStore {
         .map(|_| ())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size, chunk_size))]
     async fn truncate(&self, ino: i64, size: u64, chunk_size: u64) -> Result<(), MetaError> {
         let reverse_key = Self::etcd_reverse_key(ino);
         let old_size = self
@@ -2450,6 +2726,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
         if ino == 1 {
             return Ok(vec![(None, "/".to_string())]);
@@ -2484,6 +2761,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(out)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
         if ino == 1 {
             return Ok(vec!["/".to_string()]);
@@ -2531,10 +2809,12 @@ impl MetaStore for EtcdMetaStore {
         1
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn initialize(&self) -> Result<(), MetaError> {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
         let mut client = self.client.clone();
 
@@ -2567,6 +2847,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(deleted_files)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         let mut client = self.client.clone();
 
@@ -2600,13 +2881,27 @@ impl MetaStore for EtcdMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(chunk_id, slice_count = tracing::field::Empty)
+    )]
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let key = key_for_slice(chunk_id);
-        self.etcd_get_json(&key)
-            .await
-            .map(|e| e.unwrap_or_default())
+        let slices: Vec<SliceDesc> = self
+            .etcd_get_json(&key)
+            .instrument(tracing::trace_span!("get_slices.etcd_get", key = %key))
+            .await?
+            .unwrap_or_default();
+        tracing::Span::current().record("slice_count", slices.len());
+        Ok(slices)
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, slice),
+        fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
+    )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let key = key_for_slice(chunk_id);
 
@@ -2625,12 +2920,74 @@ impl MetaStore for EtcdMetaStore {
         .map(|_| ())
     }
 
+    async fn write(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slice: SliceDesc,
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        let slice_key = key_for_slice(chunk_id);
+        let inode_key = Self::etcd_reverse_key(ino);
+        let slice_for_update = slice;
+        let slice_key_for_stage = slice_key.clone();
+        let inode_key_for_stage = inode_key.clone();
+
+        let mut builder = TxnBuilder::new();
+        builder.add_stage(vec![slice_key, inode_key], move |ctx| {
+            let mut plans = Vec::new();
+            let mut slices: Vec<SliceDesc> = match ctx.value(&slice_key_for_stage) {
+                Some(raw) => serde_json::from_slice(raw)?,
+                None => Vec::new(),
+            };
+
+            slices.push(slice_for_update);
+
+            let slices_payload = serde_json::to_vec(&slices)?;
+            plans.push(UpdatePlan::new_write(
+                ctx,
+                slice_key_for_stage.clone(),
+                slices_payload,
+            )?);
+
+            let entry_raw = ctx
+                .value(&inode_key_for_stage)
+                .ok_or(MetaError::NotFound(ino))?;
+
+            let mut entry_info: EtcdEntryInfo = serde_json::from_slice(entry_raw)?;
+
+            if !entry_info.is_file {
+                return Err(MetaError::Internal(
+                    "Cannot set size for directory".to_string(),
+                ));
+            }
+
+            let current = entry_info.size.unwrap_or(0).max(0) as u64;
+            if new_size > current {
+                entry_info.size = Some(new_size as i64);
+                entry_info.modify_time = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let entry_payload = serde_json::to_vec(&entry_info)?;
+                plans.push(UpdatePlan::new_write(
+                    ctx,
+                    inode_key_for_stage.clone(),
+                    entry_payload,
+                )?);
+            }
+
+            Ok(plans)
+        });
+
+        builder.execute(&self.client, 10).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(key))]
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         self.generate_id(key).await
     }
 
     // ---------- Session lifecycle implementation ----------
 
+    #[tracing::instrument(level = "trace", skip(self), fields(pid = session_info.process_id))]
     async fn start_session(
         &self,
         session_info: SessionInfo,
@@ -2671,6 +3028,7 @@ impl MetaStore for EtcdMetaStore {
         Ok(session)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn shutdown_session(&self) -> Result<(), MetaError> {
         let session_id = *self.get_sid()?;
         self.shutdown_session_by_id(session_id).await?;
@@ -2678,9 +3036,11 @@ impl MetaStore for EtcdMetaStore {
     }
 
     // Etcd cleanup is performed by the lease keeper
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn cleanup_sessions(&self) -> Result<(), MetaError> {
         return Ok(());
     }
+    #[tracing::instrument(level = "trace", skip(self), fields(lock_name = ?lock_name))]
     async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let result = self
             .atomic_update::<_, _, i64, bool>(
@@ -2711,6 +3071,11 @@ impl MetaStore for EtcdMetaStore {
         }
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, req),
+        fields(ino, size = req.size, flags = ?flags)
+    )]
     async fn set_attr(
         &self,
         ino: i64,
@@ -2903,6 +3268,7 @@ impl MetaStore for EtcdMetaStore {
     }
 
     // returns the current lock owner for a range on a file.
+    #[tracing::instrument(level = "trace", skip(self, query), fields(inode, owner = query.owner))]
     async fn get_plock(
         &self,
         inode: i64,
@@ -2931,6 +3297,11 @@ impl MetaStore for EtcdMetaStore {
     }
 
     // sets a file range lock on given file.
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(inode, owner, block, lock_type = ?lock_type, pid)
+    )]
     async fn set_plock(
         &self,
         inode: i64,

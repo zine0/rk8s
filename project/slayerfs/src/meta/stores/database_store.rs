@@ -18,6 +18,7 @@ use crate::meta::store::{
     StatFsSnapshot,
 };
 use crate::meta::{INODE_ID_KEY, Permission, SLICE_ID_KEY};
+use crate::utils::NumCastExt;
 use crate::vfs::chunk_id_for;
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{Instrument, error};
 
 #[derive(Eq, Hash, PartialEq)]
 struct PlockHashMapKey {
@@ -571,7 +572,12 @@ impl DatabaseMetaStore {
                     .map_err(MetaError::Database)?;
 
                 for row in rows {
-                    match trim_action(row.offset as u32, row.length as u32, cutoff_offset) {
+                    debug_assert!(row.offset >= 0);
+                    debug_assert!(row.length >= 0);
+                    let offset = row.offset as u64;
+                    let length = row.length as u64;
+
+                    match trim_action(offset, length, cutoff_offset) {
                         TrimAction::Keep => {}
                         TrimAction::Drop => {
                             let active: slice_meta::ActiveModel = row.into();
@@ -579,7 +585,7 @@ impl DatabaseMetaStore {
                         }
                         TrimAction::Truncate(new_len) => {
                             let mut active: slice_meta::ActiveModel = row.into();
-                            active.length = Set(new_len as i32);
+                            active.length = Set(new_len as i64);
                             active.update(conn).await.map_err(MetaError::Database)?;
                         }
                     }
@@ -925,6 +931,7 @@ impl MetaStore for DatabaseMetaStore {
         "database"
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
             return Ok(Some(Self::file_meta_to_attr(&file_meta)));
@@ -938,6 +945,11 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     /// Batch stat implementation using SQL WHERE IN clause for optimal performance
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, inodes),
+        fields(inode_count = inodes.len())
+    )]
     async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
         if inodes.is_empty() {
             return Ok(Vec::new());
@@ -975,6 +987,7 @@ impl MetaStore for DatabaseMetaStore {
             .collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         let entry = ContentMeta::find()
             .filter(content_meta::Column::ParentInode.eq(parent))
@@ -986,6 +999,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(entry.map(|e| e.inode))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(path))]
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path == "/" {
             return Ok(Some((1, FileType::Dir)));
@@ -1033,6 +1047,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(Some((current_inode, FileType::Dir)))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let access_meta = self
             .get_access_meta(ino)
@@ -1066,10 +1081,12 @@ impl MetaStore for DatabaseMetaStore {
         Ok(entries)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_directory(parent, name).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -1128,10 +1145,12 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_file_internal(parent, name).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -1238,6 +1257,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, parent, name))]
     async fn link(&self, ino: i64, parent: i64, name: &str) -> Result<FileAttr, MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -1406,6 +1426,7 @@ impl MetaStore for DatabaseMetaStore {
         self.stat(ino).await?.ok_or(MetaError::NotFound(ino))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name, target))]
     async fn symlink(
         &self,
         parent: i64,
@@ -1483,6 +1504,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok((inode, attr))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
         let file = FileMeta::find_by_id(ino)
             .one(&self.db)
@@ -1494,6 +1516,11 @@ impl MetaStore for DatabaseMetaStore {
             .ok_or_else(|| MetaError::NotSupported(format!("inode {ino} is not a symbolic link")))
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(old_parent, old_name, new_parent, new_name)
+    )]
     async fn rename(
         &self,
         old_parent: i64,
@@ -1840,6 +1867,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size))]
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let mut file_meta: file_meta::ActiveModel = FileMeta::find_by_id(ino)
             .one(&self.db)
@@ -1900,6 +1928,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size, chunk_size))]
     async fn truncate(&self, ino: i64, size: u64, chunk_size: u64) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -1928,6 +1957,11 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, req),
+        fields(ino, size = req.size, flags = ?flags)
+    )]
     async fn set_attr(
         &self,
         ino: i64,
@@ -2115,6 +2149,7 @@ impl MetaStore for DatabaseMetaStore {
         Err(MetaError::NotFound(ino))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
         if ino == 1 {
             return Ok(vec![(None, "/".to_string())]);
@@ -2151,6 +2186,7 @@ impl MetaStore for DatabaseMetaStore {
             .collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, flags = ?flags))]
     async fn open(&self, ino: i64, flags: OpenFlags) -> Result<FileAttr, MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -2224,6 +2260,7 @@ impl MetaStore for DatabaseMetaStore {
         Err(MetaError::NotFound(ino))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn close(&self, ino: i64) -> Result<(), MetaError> {
         if self.stat(ino).await?.is_some() {
             Ok(())
@@ -2232,6 +2269,7 @@ impl MetaStore for DatabaseMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
         if ino == 1 {
             return Ok(vec!["/".to_string()]);
@@ -2283,10 +2321,12 @@ impl MetaStore for DatabaseMetaStore {
         1
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn initialize(&self) -> Result<(), MetaError> {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
         let files = FileMeta::find()
             .all(&self.db)
@@ -2309,6 +2349,7 @@ impl MetaStore for DatabaseMetaStore {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
         let deleted_files = FileMeta::find()
             .filter(file_meta::Column::Deleted.eq(true))
@@ -2319,6 +2360,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(deleted_files.into_iter().map(|f| f.inode).collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
@@ -2347,23 +2389,36 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(chunk_id, slice_count = tracing::field::Empty)
+    )]
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let rows = SliceMeta::find()
             .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
             .order_by_asc(slice_meta::Column::Id)
             .all(&self.db)
+            .instrument(tracing::trace_span!("get_slices.query", chunk_id))
             .await
             .map_err(MetaError::Database)?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        let slices: Vec<SliceDesc> = rows.into_iter().map(Into::into).collect();
+        tracing::Span::current().record("slice_count", slices.len());
+        Ok(slices)
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, slice),
+        fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
+    )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let model = slice_meta::ActiveModel {
             chunk_id: Set(chunk_id as i64),
             slice_id: Set(slice.slice_id as i64),
-            offset: Set(slice.offset as i32),
-            length: Set(slice.length as i32),
+            offset: Set(slice.offset.as_i64()),
+            length: Set(slice.length.as_i64()),
             ..Default::default()
         };
 
@@ -2371,6 +2426,65 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, slice),
+        fields(ino, chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length, new_size)
+    )]
+    async fn write(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slice: SliceDesc,
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        let txn = self.db.begin().await.map_err(MetaError::Database)?;
+
+        let model = slice_meta::ActiveModel {
+            chunk_id: Set(chunk_id as i64),
+            slice_id: Set(slice.slice_id as i64),
+            offset: Set(slice.offset.as_i64()),
+            length: Set(slice.length.as_i64()),
+            ..Default::default()
+        };
+
+        if let Err(err) = model.insert(&txn).await {
+            let _ = txn.rollback().await;
+            return Err(MetaError::Database(err));
+        }
+
+        let now = Self::now_nanos();
+        let result = file_meta::Entity::update_many()
+            .col_expr(
+                file_meta::Column::Size,
+                sea_query::Expr::val(new_size as i64).into(),
+            )
+            .col_expr(
+                file_meta::Column::ModifyTime,
+                sea_query::Expr::val(now).into(),
+            )
+            .filter(file_meta::Column::Inode.eq(ino))
+            .filter(file_meta::Column::Size.lt(new_size as i64))
+            .exec(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+
+        if result.rows_affected == 0 {
+            let exists = FileMeta::find_by_id(ino)
+                .one(&txn)
+                .await
+                .map_err(MetaError::Database)?;
+            if exists.is_none() {
+                let _ = txn.rollback().await;
+                return Err(MetaError::NotFound(ino));
+            }
+        }
+
+        txn.commit().await.map_err(MetaError::Database)?;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(key))]
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         match key {
             SLICE_ID_KEY => Ok(self.next_slice.fetch_add(1, Ordering::SeqCst) as i64),
@@ -2383,6 +2497,7 @@ impl MetaStore for DatabaseMetaStore {
 
     // ---------- Session lifecycle implementation ----------
 
+    #[tracing::instrument(level = "trace", skip(self), fields(pid = session_info.process_id))]
     async fn start_session(
         &self,
         session_info: SessionInfo,
@@ -2413,6 +2528,7 @@ impl MetaStore for DatabaseMetaStore {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn shutdown_session(&self) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
         let session_id = self.get_sid()?;
@@ -2421,6 +2537,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn cleanup_sessions(&self) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
         let sessions = SessionMeta::find()
@@ -2436,6 +2553,7 @@ impl MetaStore for DatabaseMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(lock_name = ?lock_name))]
     async fn get_global_lock(&self, lock_name: LockName) -> bool {
         self.get_lock_internal(lock_name).await.unwrap_or_default()
     }
@@ -2445,6 +2563,7 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     // returns the current lock owner for a range on a file.
+    #[tracing::instrument(level = "trace", skip(self, query), fields(inode, owner = query.owner))]
     async fn get_plock(
         &self,
         inode: i64,
@@ -2477,6 +2596,11 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     // sets a file range lock on given file.
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(inode, owner, block, lock_type = ?lock_type, pid)
+    )]
     async fn set_plock(
         &self,
         inode: i64,

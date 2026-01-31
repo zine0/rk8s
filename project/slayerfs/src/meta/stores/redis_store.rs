@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::select;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{Instrument, error};
 use uuid::Uuid;
 
 const ROOT_INODE: i64 = 1;
@@ -672,11 +672,17 @@ impl MetaStore for RedisMetaStore {
         "redis-meta-store"
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
         Ok(self.get_node(ino).await?.map(|n| n.as_file_attr()))
     }
 
     /// Batch stat implementation using Redis MGET for optimal performance
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, inodes),
+        fields(inode_count = inodes.len())
+    )]
     async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
         if inodes.is_empty() {
             return Ok(Vec::new());
@@ -707,10 +713,12 @@ impl MetaStore for RedisMetaStore {
         Ok(results)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         self.directory_child(parent, name).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(path))]
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError> {
         if path.is_empty() {
             return Ok(None);
@@ -732,6 +740,7 @@ impl MetaStore for RedisMetaStore {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError> {
         let node = self.get_node(ino).await?.ok_or(MetaError::NotFound(ino))?;
         if node.kind != NodeKind::Dir {
@@ -753,10 +762,12 @@ impl MetaStore for RedisMetaStore {
         Ok(result)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_entry(parent, name, FileType::Dir).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let Some(child) = self.lookup(parent, name).await? else {
             return Err(MetaError::NotFound(parent));
@@ -780,10 +791,12 @@ impl MetaStore for RedisMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.create_entry(parent, name, FileType::File).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, parent, name))]
     async fn link(&self, ino: i64, parent: i64, name: &str) -> Result<FileAttr, MetaError> {
         self.ensure_parent_dir(parent).await?;
         if self.directory_child(parent, name).await?.is_some() {
@@ -841,6 +854,7 @@ impl MetaStore for RedisMetaStore {
         Ok(node.as_file_attr())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         let Some(child) = self.lookup(parent, name).await? else {
             return Err(MetaError::NotFound(parent));
@@ -903,6 +917,11 @@ impl MetaStore for RedisMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(old_parent, old_name, new_parent, new_name)
+    )]
     async fn rename(
         &self,
         old_parent: i64,
@@ -1048,7 +1067,11 @@ impl MetaStore for RedisMetaStore {
 
         Ok(())
     }
-
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, req),
+        fields(ino, size = req.size, flags = ?flags)
+    )]
     async fn set_attr(
         &self,
         ino: i64,
@@ -1123,6 +1146,7 @@ impl MetaStore for RedisMetaStore {
         Ok(node.attr.to_file_attr(node.ino, node.kind.into()))
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size))]
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         let mut node = self.get_node(ino).await?.ok_or(MetaError::NotFound(ino))?;
         let now = current_time();
@@ -1147,6 +1171,7 @@ impl MetaStore for RedisMetaStore {
         self.save_node(&node).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino, size, chunk_size))]
     async fn truncate(&self, ino: i64, size: u64, chunk_size: u64) -> Result<(), MetaError> {
         let mut node = self.get_node(ino).await?.ok_or(MetaError::NotFound(ino))?;
         let old_size = node.attr.size;
@@ -1159,6 +1184,7 @@ impl MetaStore for RedisMetaStore {
         self.save_node(&node).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_names(&self, ino: i64) -> Result<Vec<(Option<i64>, String)>, MetaError> {
         let Some(node) = self.get_node(ino).await? else {
             return Ok(vec![]);
@@ -1186,6 +1212,7 @@ impl MetaStore for RedisMetaStore {
         Ok(out)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn get_paths(&self, ino: i64) -> Result<Vec<String>, MetaError> {
         if ino == ROOT_INODE {
             return Ok(vec!["/".to_string()]);
@@ -1232,10 +1259,12 @@ impl MetaStore for RedisMetaStore {
         ROOT_INODE
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn initialize(&self) -> Result<(), MetaError> {
         self.init_root_directory().await
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_deleted_files(&self) -> Result<Vec<i64>, MetaError> {
         let mut conn = self.conn.clone();
         let raw: Vec<String> = conn
@@ -1254,6 +1283,7 @@ impl MetaStore for RedisMetaStore {
         Ok(inodes)
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn remove_file_metadata(&self, ino: i64) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
         let _: () = conn
@@ -1263,6 +1293,11 @@ impl MetaStore for RedisMetaStore {
         self.delete_node(ino).await
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(chunk_id, slice_count = tracing::field::Empty)
+    )]
     async fn get_slices(&self, chunk_id: u64) -> Result<Vec<SliceDesc>, MetaError> {
         let mut conn = self.conn.clone();
         let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
@@ -1270,6 +1305,7 @@ impl MetaStore for RedisMetaStore {
             .arg(0)
             .arg(-1)
             .query_async(&mut conn)
+            .instrument(tracing::trace_span!("get_slices.redis_lrange", chunk_id))
             .await
             .map_err(redis_err)?;
         let mut slices = Vec::new();
@@ -1278,9 +1314,15 @@ impl MetaStore for RedisMetaStore {
                 serde_json::from_slice(&entry).map_err(|e| MetaError::Internal(e.to_string()))?;
             slices.push(desc);
         }
+        tracing::Span::current().record("slice_count", slices.len());
         Ok(slices)
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, slice),
+        fields(chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length)
+    )]
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
         let data = serde_json::to_vec(&slice).map_err(|e| MetaError::Internal(e.to_string()))?;
@@ -1293,10 +1335,28 @@ impl MetaStore for RedisMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, slice),
+        fields(ino, chunk_id, slice_id = slice.slice_id, offset = slice.offset, len = slice.length, new_size)
+    )]
+    async fn write(
+        &self,
+        ino: i64,
+        chunk_id: u64,
+        slice: SliceDesc,
+        new_size: u64,
+    ) -> Result<(), MetaError> {
+        self.append_slice(chunk_id, slice).await?;
+        self.extend_file_size(ino, new_size).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(key))]
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         self.alloc_id(key).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(pid = session_info.process_id))]
     async fn start_session(
         &self,
         session_info: SessionInfo,
@@ -1335,12 +1395,14 @@ impl MetaStore for RedisMetaStore {
         Ok(session)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn shutdown_session(&self) -> Result<(), MetaError> {
         let session_id = self.get_sid()?;
         self.shutdown_session_by_id(*session_id).await?;
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn cleanup_sessions(&self) -> Result<(), MetaError> {
         let mut conn = self.conn.clone();
         let now = Utc::now().timestamp_millis();
@@ -1356,6 +1418,7 @@ impl MetaStore for RedisMetaStore {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self), fields(lock_name = ?lock_name))]
     async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let lock_name = lock_name.to_string();
         let mut conn = self.conn.clone();
@@ -1409,6 +1472,7 @@ impl MetaStore for RedisMetaStore {
     }
 
     // returns the current lock owner for a range on a file.
+    #[tracing::instrument(level = "trace", skip(self, query), fields(inode, owner = query.owner))]
     async fn get_plock(
         &self,
         inode: i64,
@@ -1467,6 +1531,11 @@ impl MetaStore for RedisMetaStore {
     }
 
     // sets a file range lock on given file.
+    #[tracing::instrument(
+        level = "trace",
+        skip(self),
+        fields(inode, owner, block, lock_type = ?lock_type, pid)
+    )]
     async fn set_plock(
         &self,
         inode: i64,

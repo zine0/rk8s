@@ -9,7 +9,7 @@
 use crate::chuck::reader::DataFetcher;
 use crate::chuck::{BlockStore, ChunkLayout};
 use crate::meta::MetaLayer;
-use crate::utils::Intervals;
+use crate::utils::{Intervals, NumCastExt};
 use crate::vfs::backend::Backend;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::ReadConfig;
@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 const MAX_WAIT: Duration = Duration::from_secs(30);
 
@@ -30,7 +31,7 @@ const MAX_WAIT: Duration = Duration::from_secs(30);
 pub(crate) struct DataReader<B, M> {
     config: Arc<ReadConfig>,
     buffer_usage: Arc<AtomicU64>,
-    // per-handle readers, grouped by inode
+    /// Per-handle readers, grouped by inode
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
 }
@@ -215,7 +216,7 @@ struct SliceState {
     /// Chunk index it belongs to
     index: u64,
     /// Range it contains
-    range: (u32, u32),
+    range: (u64, u64),
     page: Vec<u8>,
     state: SliceStatus,
     err: Option<String>,
@@ -224,10 +225,14 @@ struct SliceState {
     generation: u64,
     /// Reference count
     refs: u16,
+    /// Queue delay (milliseconds) before the fetch task actually started.
+    queue_delay_ms: Option<u64>,
+    /// Fetch duration (milliseconds) for the last successful/failed attempt.
+    fetch_ms: Option<u64>,
 }
 
 impl SliceState {
-    fn new(index: u64, range: (u32, u32), refs: u16) -> Self {
+    fn new(index: u64, range: (u64, u64), refs: u16) -> Self {
         Self {
             index,
             range,
@@ -237,6 +242,8 @@ impl SliceState {
             notify: Arc::new(Notify::new()),
             generation: 0,
             refs,
+            queue_delay_ms: None,
+            fetch_ms: None,
         }
     }
 
@@ -247,7 +254,7 @@ impl SliceState {
         )
     }
 
-    fn overlaps(&self, offset: u32, len: u32) -> bool {
+    fn overlaps(&self, offset: u64, len: u64) -> bool {
         let end = offset.saturating_add(len);
         self.range.0 < end && offset < self.range.1
     }
@@ -262,7 +269,10 @@ impl SliceState {
         B: BlockStore + Send + Sync + 'static,
         M: MetaLayer + Send + Sync + 'static,
     {
+        let queued_at = Instant::now();
         tokio::spawn(async move {
+            let start_at = Instant::now();
+            let queue_delay_ms = start_at.duration_since(queued_at).as_millis() as u64;
             let (index, (start, end), generation) = {
                 let mut guard = this.lock();
                 match guard.state {
@@ -273,6 +283,8 @@ impl SliceState {
                         guard.state = SliceStatus::Busy;
                     }
                 }
+                guard.queue_delay_ms = Some(queue_delay_ms);
+                guard.fetch_ms = None;
                 (guard.index, guard.range, guard.generation)
             };
 
@@ -281,11 +293,12 @@ impl SliceState {
                 let mut fetcher = DataFetcher::new(layout, chunk_id, &backend);
                 fetcher.prepare_slices().await?;
 
-                let out = fetcher.read_at(start, (end - start) as usize).await?;
+                let out = fetcher.read_at(start, (end - start).as_usize()).await?;
                 Ok::<_, anyhow::Error>(out)
             };
 
             let result = f().await;
+            let fetch_ms = start_at.elapsed().as_millis() as u64;
             let mut guard = this.lock();
 
             // Stale fetch and needs to drop.
@@ -293,6 +306,7 @@ impl SliceState {
                 return;
             }
 
+            guard.fetch_ms = Some(fetch_ms);
             match result {
                 Ok(out) => {
                     let old_len = guard.page.len() as u64;
@@ -373,6 +387,7 @@ where
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -483,8 +498,8 @@ where
             }
 
             let base = slice.index * self.config.layout.chunk_size;
-            let slice_start = base + slice.range.0 as u64;
-            let slice_end = base + slice.range.1 as u64;
+            let slice_start = base + slice.range.0;
+            let slice_end = base + slice.range.1;
 
             let overlaps_current = slice_start < cur_end && cur_start < slice_end;
             let needed_by_session = windows
@@ -546,72 +561,140 @@ where
             return Ok(0);
         }
 
-        self.back_pressure().await?;
-        self.clean_evictable_slices(offset, actual_len).await;
+        self.clean_evictable_slices(offset, actual_len)
+            .instrument(tracing::trace_span!(
+                "read_at.clean_evictable_slices",
+                offset,
+                len = actual_len
+            ))
+            .await;
+        self.back_pressure()
+            .instrument(tracing::trace_span!("read_at.back_pressure"))
+            .await?;
 
-        // Pre-fill with zeros so holes or missing slices read as zeros.
-        buf[..actual_len].fill(0);
+        tracing::trace_span!("read_at.zero_fill", len = actual_len)
+            .in_scope(|| buf[..actual_len].fill(0));
 
-        let spans = split_chunk_spans(self.config.layout, offset, actual_len);
+        let spans = tracing::trace_span!("read_at.split_spans", offset, len = actual_len)
+            .in_scope(|| split_chunk_spans(self.config.layout, offset, actual_len));
 
         let mut pin_guard = Vec::new();
         for span in spans.iter().copied() {
             // `prepare_slices` don't wait for all data is ready.
             pin_guard.push(
                 self.prepare_slices(span.index, (span.offset, span.offset + span.len))
+                    .instrument(tracing::trace_span!(
+                        "read_at.prepare_slice",
+                        index = span.index,
+                        offset = span.offset,
+                        len = span.len
+                    ))
                     .await,
             );
         }
 
-        self.check_session(offset, actual_len);
+        tracing::trace_span!("read_at.check_session", offset, len = actual_len)
+            .in_scope(|| self.check_session(offset, actual_len));
 
         let mut tail = buf;
         let result = async {
             for span in spans {
-                let (seg, rest) = tail.split_at_mut(span.len as usize);
+                let span_len = span.len.as_usize();
+                let (seg, rest) = tail.split_at_mut(span_len);
                 tail = rest;
                 self.read_from_slice(span.index, span.offset, seg).await?;
             }
             Ok::<_, anyhow::Error>(actual_len)
         }
+        .instrument(tracing::trace_span!("read_at.read_spans"))
         .await;
 
         drop(pin_guard);
 
         // Do a cleanup each read.
-        self.cleanup_invalid().await;
+        self.cleanup_invalid()
+            .instrument(tracing::trace_span!("read_at.cleanup_invalid"))
+            .await;
         result
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        skip(slice),
+        fields(
+            total_wait_ms = tracing::field::Empty,
+            waits = tracing::field::Empty,
+            queue_ms = tracing::field::Empty,
+            fetch_ms = tracing::field::Empty
+        )
+    )]
     async fn wait_ready(slice: &Arc<ParkingMutex<SliceState>>) -> anyhow::Result<()> {
+        let mut total_wait = Duration::ZERO;
+        let mut waits: u64 = 0;
         loop {
             let notify = {
                 let guard = slice.lock();
 
                 match guard.state {
-                    SliceStatus::Ready => return Ok(()),
+                    SliceStatus::Ready => {
+                        if let Some(queue_ms) = guard.queue_delay_ms {
+                            tracing::Span::current().record("queue_ms", queue_ms);
+                        }
+                        if let Some(fetch_ms) = guard.fetch_ms {
+                            tracing::Span::current().record("fetch_ms", fetch_ms);
+                        }
+                        tracing::Span::current()
+                            .record("total_wait_ms", total_wait.as_millis() as u64);
+                        tracing::Span::current().record("waits", waits);
+                        return Ok(());
+                    }
                     SliceStatus::Invalid => {
                         let err = guard.err.as_deref().unwrap_or("slice invalid");
+                        if let Some(queue_ms) = guard.queue_delay_ms {
+                            tracing::Span::current().record("queue_ms", queue_ms);
+                        }
+                        if let Some(fetch_ms) = guard.fetch_ms {
+                            tracing::Span::current().record("fetch_ms", fetch_ms);
+                        }
+                        tracing::Span::current()
+                            .record("total_wait_ms", total_wait.as_millis() as u64);
+                        tracing::Span::current().record("waits", waits);
                         return Err(anyhow::anyhow!("Slice fetch failed: {err}"));
                     }
                     _ => guard.notify.clone(),
                 }
             };
-            notify.notified().await;
+            let start = Instant::now();
+            notify
+                .notified()
+                .instrument(tracing::trace_span!("wait_ready.wait"))
+                .await;
+            total_wait += start.elapsed();
+            waits = waits.saturating_add(1);
+            tracing::Span::current().record("total_wait_ms", total_wait.as_millis() as u64);
+            tracing::Span::current().record("waits", waits);
         }
     }
 
     // Read from cached slices for a chunk. This waits for slice readiness and copies
     // overlapping ranges into the provided buffer.
-    async fn read_from_slice(&self, index: u64, offset: u32, buf: &mut [u8]) -> anyhow::Result<()> {
-        let slices = {
+    #[tracing::instrument(level = "trace", skip(self, buf), fields(index, offset, len = buf.len()))]
+    async fn read_from_slice(&self, index: u64, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        let slices = async {
             let guard = self.slices.lock().await;
             guard
                 .iter()
                 .filter(|s| s.lock().index == index)
                 .cloned()
                 .collect::<Vec<_>>()
-        };
+        }
+        .instrument(tracing::trace_span!(
+            "read_from_slice.collect_slices",
+            index,
+            offset,
+            len = buf.len()
+        ))
+        .await;
 
         for slice in slices {
             // There locks the slice twice, but it is still worth it
@@ -620,7 +703,7 @@ where
                 let guard = slice.lock();
                 (
                     offset.max(guard.range.0),
-                    guard.range.1.min(offset + buf.len() as u32),
+                    guard.range.1.min(offset + buf.len() as u64),
                 )
             };
 
@@ -637,13 +720,25 @@ where
             let src_start = dst_start - guard.range.0;
             let src_end = dst_end - guard.range.0;
 
-            buf[dst_local_start as usize..dst_local_end as usize]
-                .copy_from_slice(&guard.page[src_start as usize..src_end as usize]);
+            tracing::trace_span!(
+                "read_from_slice.copy_out",
+                index,
+                dst_start,
+                dst_end,
+                src_start,
+                src_end,
+                bytes = (dst_end - dst_start)
+            )
+            .in_scope(|| {
+                buf[dst_local_start.as_usize()..dst_local_end.as_usize()]
+                    .copy_from_slice(&guard.page[src_start.as_usize()..src_end.as_usize()]);
+            });
         }
         Ok(())
     }
 
-    async fn prepare_slices(&self, index: u64, (start, end): (u32, u32)) -> SlicePinGuard {
+    #[tracing::instrument(level = "trace", skip(self), fields(index, start, end))]
+    async fn prepare_slices(&self, index: u64, (start, end): (u64, u64)) -> SlicePinGuard {
         let mut pinned = SlicePinGuard::new();
         let mut cutter = Intervals::new(start, end);
 
@@ -792,11 +887,13 @@ mod tests {
     use crate::chuck::ChunkLayout;
     use crate::chuck::store::InMemoryBlockStore;
     use crate::chuck::writer::DataUploader;
+    use crate::meta::MetaLayer;
     use crate::meta::SLICE_ID_KEY;
     use crate::meta::factory::create_meta_store_from_url;
     use crate::vfs::config::{ReadConfig, WriteConfig};
     use crate::vfs::io::writer::FileWriter;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -828,7 +925,7 @@ mod tests {
         let desc1 = uploader
             .write_at_vectored(
                 slice_id1 as u64,
-                offset as u32,
+                offset,
                 &[bytes::Bytes::copy_from_slice(head)],
             )
             .await
@@ -922,7 +1019,10 @@ mod tests {
             .layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
-        let ino: i64 = 66;
+        let ino = meta
+            .create_file(1, "reader_write_eventual.txt".to_string())
+            .await
+            .unwrap();
         let data = vec![5u8; 2048];
         let inode = Inode::new(ino, 0);
 
@@ -937,6 +1037,7 @@ mod tests {
             Arc::new(WriteConfig::new(layout).page_size(4 * 1024)),
             backend.clone(),
             reader,
+            Arc::new(AtomicU64::new(0)),
         ));
 
         let write_task = {

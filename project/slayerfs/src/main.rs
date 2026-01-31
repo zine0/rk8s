@@ -6,18 +6,24 @@ mod meta;
 mod utils;
 mod vfs;
 
-use std::fs::File;
-use std::io::BufWriter;
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 use tikv_jemallocator::Jemalloc;
+
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(feature = "profiling")]
+use std::fs::File;
+#[cfg(feature = "profiling")]
+use std::io::BufWriter;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(feature = "profiling")]
+use std::sync::{LazyLock, Mutex as StdMutex};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -91,9 +97,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Mount(args) => mount_cmd(args).await,
     };
     shutdown_flame();
+    shutdown_chrome();
     result
 }
 
+#[cfg(feature = "profiling")]
 fn init_tracing() {
     let flame_layer = std::env::var("SLAYERFS_TRACE_FLAME").ok().and_then(|path| {
         let path_for_log = path.clone();
@@ -113,6 +121,17 @@ fn init_tracing() {
             }
         }
     });
+    let chrome_layer = std::env::var("SLAYERFS_TRACE_CHROME").ok().map(|path| {
+        let path_for_log = path.clone();
+        let builder = tracing_chrome::ChromeLayerBuilder::new()
+            .file(path)
+            .trace_style(tracing_chrome::TraceStyle::Async)
+            .include_args(true);
+        let (layer, guard) = builder.build();
+        eprintln!("[slayerfs] tracing-chrome enabled: {}", path_for_log);
+        register_chrome_guard(guard);
+        layer
+    });
     let env_filter = tracing_subscriber::EnvFilter::new(
         std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string()),
     );
@@ -122,7 +141,24 @@ fn init_tracing() {
         .with(tracing_subscriber::fmt::layer().pretty())
         .with(env_filter)
         .with(flame_layer)
+        .with(chrome_layer)
         .with(console_layer)
+        .init();
+}
+
+#[cfg(not(feature = "profiling"))]
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::new(
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "slayerfs=info".to_string()),
+    );
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_span_events(FmtSpan::CLOSE),
+        )
+        .with(env_filter)
         .init();
 }
 
@@ -166,15 +202,21 @@ async fn mount_cmd(args: MountArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "profiling")]
 static FLAME_GUARD: LazyLock<StdMutex<Option<tracing_flame::FlushGuard<BufWriter<File>>>>> =
     LazyLock::new(|| StdMutex::new(None));
+#[cfg(feature = "profiling")]
+static CHROME_GUARD: LazyLock<StdMutex<Option<tracing_chrome::FlushGuard>>> =
+    LazyLock::new(|| StdMutex::new(None));
 
+#[cfg(feature = "profiling")]
 fn register_flame_guard(guard: tracing_flame::FlushGuard<BufWriter<File>>) {
     if let Ok(mut slot) = FLAME_GUARD.lock() {
         *slot = Some(guard);
     }
 }
 
+#[cfg(feature = "profiling")]
 fn shutdown_flame() {
     if let Ok(mut slot) = FLAME_GUARD.lock()
         && let Some(guard) = slot.take()
@@ -183,6 +225,26 @@ fn shutdown_flame() {
         eprintln!("tracing-flame flush failed: {err}");
     }
 }
+
+#[cfg(not(feature = "profiling"))]
+fn shutdown_flame() {}
+
+#[cfg(feature = "profiling")]
+fn register_chrome_guard(guard: tracing_chrome::FlushGuard) {
+    if let Ok(mut slot) = CHROME_GUARD.lock() {
+        *slot = Some(guard);
+    }
+}
+
+#[cfg(feature = "profiling")]
+fn shutdown_chrome() {
+    if let Ok(mut slot) = CHROME_GUARD.lock() {
+        slot.take();
+    }
+}
+
+#[cfg(not(feature = "profiling"))]
+fn shutdown_chrome() {}
 
 async fn create_meta_store(args: &MountArgs) -> anyhow::Result<Arc<dyn MetaStore>> {
     match args.meta_backend {

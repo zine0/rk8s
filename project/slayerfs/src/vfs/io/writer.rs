@@ -15,8 +15,10 @@ use crate::chuck::{BlockStore, SliceDesc};
 use crate::meta::backoff::backoff;
 use crate::meta::store::MetaError;
 use crate::meta::{MetaLayer, SLICE_ID_KEY};
+use crate::utils::NumCastExt;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::page::CacheSlice;
+use crate::vfs::cache::page::WriteAction as PageWriteAction;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
@@ -27,11 +29,12 @@ use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout};
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 const FLUSH_DURATION: Duration = Duration::from_secs(5);
 const COMMIT_WAIT_SLICE: Duration = Duration::from_millis(100);
@@ -41,16 +44,23 @@ const UPLOAD_MAX_RETRIES: u64 = 5;
 
 const MAX_UNFLUSHED_SLICES: usize = 3;
 const MAX_SLICES_THRESHOLD: usize = 800;
+const WRITE_MAX_WAIT: Duration = Duration::from_secs(30);
 
-#[derive(Default, Copy, Clone)]
+struct UploadPlan {
+    chunk_id: u64,
+    offset: u64,
+    data: Vec<(usize, Vec<Bytes>)>,
+    slice_id: Option<u64>,
+    uploaded: u64,
+}
+
+#[derive(Default, Copy, Clone, Debug)]
 pub(crate) enum SliceStatus {
-    /// Writeable: append-only.
+    /// Writable: slice is writable and there may be uploaded blocks.
     #[default]
-    Writeable,
+    Writable,
     /// Readonly: frozen, no more writes allowed.
     Readonly,
-    /// Uploading: data is being uploaded to object storage.
-    Uploading,
     /// Uploaded: data uploaded successfully.
     Uploaded,
     /// Failed: data upload failed.
@@ -66,7 +76,9 @@ pub(crate) struct SliceState {
     /// ID of this slice (assigned on flush).
     slice_id: Option<u64>,
     /// Offset relative to the chunk start.
-    offset: u32,
+    offset: u64,
+    uploaded: u64,
+    uploading: Option<(usize, usize)>,
     data: CacheSlice,
     /// Error occurred at background thread.
     err: Option<String>,
@@ -76,13 +88,15 @@ pub(crate) struct SliceState {
 }
 
 impl SliceState {
-    pub(crate) fn new(chunk_id: u64, offset: u32, config: Arc<WriteConfig>) -> Self {
+    pub(crate) fn new(chunk_id: u64, offset: u64, config: Arc<WriteConfig>) -> Self {
         let now = Instant::now();
         Self {
-            state: SliceStatus::Writeable,
-            chunk_id,
+            state: SliceStatus::Writable,
             slice_id: None,
+            chunk_id,
             offset,
+            uploaded: 0,
+            uploading: None,
             data: CacheSlice::new(config),
             err: None,
             notify: Arc::new(Notify::new()),
@@ -91,20 +105,73 @@ impl SliceState {
         }
     }
 
-    pub(crate) fn append(&mut self, buf: &[u8]) -> anyhow::Result<()> {
-        self.data.append(buf)?;
-        self.last_mod = Instant::now();
-        Ok(())
-    }
+    pub(crate) fn can_write(&self, offset: u64, len: usize) -> Option<PageWriteAction> {
+        if !matches!(self.state, SliceStatus::Writable) || offset < self.offset {
+            return None;
+        }
 
-    pub(crate) fn can_append(&self, offset: u32) -> bool {
-        if !matches!(self.state, SliceStatus::Writeable) || offset < self.offset {
-            return false;
+        let size = self.data.block_size();
+        let pending_start = if let Some((_, end)) = self.uploading {
+            end as u64 * size as u64
+        } else {
+            self.uploaded
+        };
+
+        let off_to_slice = offset - self.offset;
+
+        // Uploaded blocks cannot be overlapped.
+        if off_to_slice < pending_start.max(self.uploaded) {
+            return None;
         }
 
         // For this function, the `offset` is relative to the chunk start,
         // whereas in `CacheSlice.append`, it is relative to the slice start.
-        self.data.can_append(offset - self.offset)
+        self.data.can_write(off_to_slice, len as u64)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
+    pub(crate) fn write(
+        &mut self,
+        offset: u64,
+        buf: &[u8],
+        action: PageWriteAction,
+    ) -> anyhow::Result<()> {
+        self.data.write(offset - self.offset, buf, action)?;
+        self.last_mod = Instant::now();
+        Ok(())
+    }
+
+    pub fn has_idle_block(&self) -> bool {
+        let size = self.data.block_size();
+        let pending_end = self
+            .uploading
+            .map(|(_, end)| end as u64 * size as u64)
+            .unwrap_or(self.uploaded)
+            .max(self.uploaded);
+
+        let remaining = self.data.len().saturating_sub(pending_end);
+
+        if matches!(self.state, SliceStatus::Readonly | SliceStatus::Failed) {
+            remaining > 0
+        } else {
+            remaining >= size as u64
+        }
+    }
+
+    pub fn idx_need_upload(&self) -> (usize, usize) {
+        let size = self.data.block_size() as u64;
+        let start = (self.uploaded / size) as usize;
+        let end = if matches!(self.state, SliceStatus::Readonly | SliceStatus::Failed) {
+            if self.data.len() == 0 {
+                0
+            } else {
+                self.data.len().div_ceil(size) as usize
+            }
+        } else {
+            (self.data.len() / size) as usize
+        };
+
+        (start, end)
     }
 }
 
@@ -149,37 +216,64 @@ where
         f(&guard)
     }
 
-    fn can_append(&self, offset: u32) -> bool {
-        self.with_ref(|s| s.can_append(offset))
+    fn can_write(&self, offset: u64, len: usize) -> Option<PageWriteAction> {
+        self.with_ref(|s| s.can_write(offset, len))
     }
 
-    /// Check whether the slice is appendable and append buf atomically.
-    /// The offset is relative to chunk start.
-    fn try_append(&self, offset: u32, buf: &[u8]) -> anyhow::Result<bool> {
-        self.with_mut(|s| {
-            if !s.can_append(offset) {
-                return Ok(false);
-            }
+    fn try_write(&self, offset: u64, buf: &[u8]) -> anyhow::Result<bool> {
+        let (wrote, delta) = self.with_mut(|s| match s.can_write(offset, buf.len()) {
+            Some(action) => {
+                let before = s.data.alloc_bytes();
+                s.write(offset, buf, action)?;
+                let after = s.data.alloc_bytes();
 
-            s.append(buf)?;
-            Ok(true)
-        })
+                Ok::<(bool, u64), anyhow::Error>((true, after.saturating_sub(before)))
+            }
+            None => Ok::<(bool, u64), anyhow::Error>((false, 0)),
+        })?;
+
+        if wrote && delta > 0 {
+            self.shared.add_usage(delta);
+        }
+        Ok(wrote)
     }
 
     fn freeze(&self) -> bool {
         self.with_mut(|s| {
-            if matches!(s.state, SliceStatus::Writeable) {
+            if matches!(s.state, SliceStatus::Writable) {
                 s.state = SliceStatus::Readonly;
                 s.data.freeze();
+
+                if s.uploading.is_none() && !s.has_idle_block() {
+                    s.state = SliceStatus::Uploaded;
+                    s.err = None;
+                    s.notify.notify_waiters();
+                }
                 return true;
             }
             false
         })
     }
 
+    fn advance_upload(&self, len: u64, need_release: Vec<usize>) {
+        self.with_mut(|s| {
+            s.uploading = None;
+            s.uploaded += len;
+            let freed = s.data.release_block(need_release);
+            self.shared.sub_usage(freed);
+
+            if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed) && !s.has_idle_block()
+            {
+                s.state = SliceStatus::Uploaded;
+                s.err = None;
+            }
+            s.notify.notify_waiters();
+        })
+    }
+
     fn should_freeze(&self) -> bool {
         self.with_ref(|s| {
-            let end = s.offset as u64 + s.data.len() as u64;
+            let end = s.offset + s.data.len();
             end >= self.shared.config.layout.chunk_size
         })
     }
@@ -188,54 +282,54 @@ where
         self.with_ref(|s| SliceRuntime {
             status: s.state,
             err: s.err.clone(),
-            frozen: !matches!(s.state, SliceStatus::Writeable),
+            frozen: !matches!(s.state, SliceStatus::Writable),
             started: s.started,
             notify: s.notify.clone(),
         })
     }
 
-    // Transition Readonly/Failed -> Uploading. Returns false if already uploading/finished.
-    fn start_uploading(&self) -> bool {
-        self.with_mut(|s| {
-            if matches!(s.state, SliceStatus::Readonly | SliceStatus::Failed) {
-                s.state = SliceStatus::Uploading;
-                s.err = None;
-                return true;
-            }
-            false
-        })
-    }
-
-    // Mark data upload success. Commit thread can now append metadata.
-    fn mark_uploaded(&self) {
-        self.with_mut(|s| {
-            if matches!(s.state, SliceStatus::Uploading | SliceStatus::Readonly) {
-                s.state = SliceStatus::Uploaded;
-                s.err = None;
-            }
-            s.notify.notify_waiters();
-        })
+    fn can_continue_upload(&self) -> bool {
+        self.with_ref(|s| s.has_idle_block() && s.uploading.is_none())
     }
 
     // Mark data upload failure and wake commit waiters.
     fn mark_failed(&self, err: anyhow::Error) {
         self.with_mut(|s| {
             s.state = SliceStatus::Failed;
+            s.uploading = None;
+
             if s.err.is_none() {
                 s.err = Some(err.to_string());
             }
+
             s.notify.notify_waiters();
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn snapshot_for_flush(&self) -> anyhow::Result<Option<(u64, u32, Vec<Bytes>, Option<u64>)>> {
-        self.with_ref(|s| {
-            if s.data.len() == 0 {
+    fn prepare_upload(&self) -> anyhow::Result<Option<UploadPlan>> {
+        self.with_mut(|s| {
+            if s.uploading.is_some() || !s.has_idle_block() {
                 return Ok(None);
             }
-            let data = s.data.collect_pages()?;
-            Ok(Some((s.chunk_id, s.offset, data, s.slice_id)))
+
+            let (start, end) = s.idx_need_upload();
+
+            if end <= start {
+                return Ok(None);
+            }
+
+            s.data.freeze_blocks(start, end);
+
+            let data = s.data.collect_pages(start, end)?;
+            s.uploading = Some((start, end));
+
+            Ok(Some(UploadPlan {
+                chunk_id: s.chunk_id,
+                offset: s.offset,
+                data,
+                slice_id: s.slice_id,
+                uploaded: s.uploaded,
+            }))
         })
     }
 
@@ -319,7 +413,7 @@ where
     /// A slice is append-only.
     fn find_slice_or_create(
         &mut self,
-        offset: u32,
+        offset: u64,
         len: usize,
     ) -> anyhow::Result<(Arc<ParkingMutex<SliceState>>, WriteAction)> {
         let (chunk_id, mut slices) = {
@@ -333,7 +427,7 @@ where
         };
 
         anyhow::ensure!(
-            offset as u64 + len as u64 <= self.shared.config.layout.chunk_size,
+            offset + len as u64 <= self.shared.config.layout.chunk_size,
             "A write operation cannot exceed the chunk size"
         );
 
@@ -345,7 +439,7 @@ where
                 shared: self.shared,
             };
 
-            if handle.can_append(offset) {
+            if handle.can_write(offset, len).is_some() {
                 found = Some(slice.clone());
                 break;
             }
@@ -384,6 +478,7 @@ where
             chunk.commit_started = true;
             start_commit = true;
         }
+
         Ok((
             slice,
             WriteAction {
@@ -393,8 +488,9 @@ where
         ))
     }
 
-    // Append data to a writable slice. If the slice reaches chunk end, freeze + flush it.
-    fn write_at(&mut self, offset: u32, buf: &[u8]) -> anyhow::Result<WriteAction> {
+    /// Append data to a writable slice. If the slice reaches chunk end, freeze + flush it.
+    #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> anyhow::Result<WriteAction> {
         let mut start_commit = false;
         let mut flush = Vec::new();
 
@@ -404,6 +500,7 @@ where
         // so when handle trying appending buf, the slice may have become readonly. This is highly unlikely to happen,
         // therefore, it is ok to retry until success.
         let mut failed_cnt = 0;
+
         loop {
             let (slice, action) = self.find_slice_or_create(offset, buf.len())?;
             start_commit |= action.start_commit;
@@ -414,10 +511,11 @@ where
                 shared: self.shared,
             };
 
-            if handle.try_append(offset, buf)? {
-                if handle.should_freeze() && handle.freeze() {
+            if handle.try_write(offset, buf)? {
+                if handle.can_continue_upload() || handle.should_freeze() && handle.freeze() {
                     flush.push(slice);
                 }
+
                 return Ok(WriteAction {
                     start_commit,
                     flush,
@@ -440,6 +538,7 @@ where
 struct Shared<B, M> {
     inode: Arc<Inode>,
     config: Arc<WriteConfig>,
+    buffer_usage: Arc<AtomicU64>,
     inner: Mutex<Inner>,
     /// Notify signal to wait write.
     write_notify: Notify,
@@ -459,10 +558,12 @@ where
         config: Arc<WriteConfig>,
         backend: Arc<Backend<B, M>>,
         reader: Arc<DataReader<B, M>>,
+        buffer_usage: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inode,
             config,
+            buffer_usage,
             inner: Mutex::new(Inner {
                 flush_waiting: 0,
                 write_waiting: 0,
@@ -472,6 +573,34 @@ where
             flush_notify: Notify::new(),
             backend,
             reader,
+        }
+    }
+
+    fn add_usage(&self, bytes: u64) {
+        if bytes > 0 {
+            self.buffer_usage.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn sub_usage(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+
+        let mut current = self.buffer_usage.load(Ordering::Relaxed);
+
+        loop {
+            let next = current.saturating_sub(bytes);
+
+            match self.buffer_usage.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(value) => current = value,
+            }
         }
     }
 }
@@ -525,13 +654,46 @@ where
     B: BlockStore + Send + Sync + 'static,
     M: MetaLayer + Send + Sync + 'static,
 {
+    async fn back_pressure(&self) -> anyhow::Result<()> {
+        let soft_limit = self.shared.config.buffer_size;
+        if soft_limit == 0 {
+            return Ok(());
+        }
+
+        let usage = self.shared.buffer_usage.load(Ordering::Relaxed);
+        if usage <= soft_limit {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let hard_limit = soft_limit.saturating_mul(2);
+        let mut total_wait = Duration::ZERO;
+
+        while self.shared.buffer_usage.load(Ordering::Relaxed) > hard_limit {
+            if total_wait >= WRITE_MAX_WAIT {
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for write buffer after {:?}. Current usage: {} bytes, limit: {} bytes",
+                    total_wait,
+                    self.shared.buffer_usage.load(Ordering::Relaxed),
+                    hard_limit,
+                ));
+            }
+
+            warn!("Reach write buffer hard limit: sleep for 100 millis");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            total_wait += Duration::from_millis(100);
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         inode: Arc<Inode>,
         config: Arc<WriteConfig>,
         backend: Arc<Backend<B, M>>,
         reader: Arc<DataReader<B, M>>,
+        buffer_usage: Arc<AtomicU64>,
     ) -> Self {
-        let shared = Arc::new(Shared::new(inode, config, backend, reader));
+        let shared = Arc::new(Shared::new(inode, config, backend, reader, buffer_usage));
         let flush_shared = Arc::downgrade(&shared);
         tokio::spawn(async move { Self::auto_flush(flush_shared).await });
         Self { shared }
@@ -541,6 +703,7 @@ where
     // trigger background flush/commit. Updates in-memory inode size at the end.
     #[tracing::instrument(level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
+        self.back_pressure().await?;
         let mut guard = self.shared.inner.lock().await;
 
         // Wait for any ongoing flush to finish. This serializes writes with flush().
@@ -567,8 +730,8 @@ where
             // unless "clone" it. So this copy seems to be inevitable.
             // Alternatively, the API signature could be modified or added to request "Bytes" from users. However,
             // this would break POSIX compatibility and is not supported by FUSE.
-            let action =
-                handle.write_at(span.offset, &buf[position..position + span.len as usize])?;
+            let span_len = span.len.as_usize();
+            let action = handle.write_at(span.offset, &buf[position..position + span_len])?;
             drop(guard);
 
             for slice in action.flush {
@@ -579,8 +742,9 @@ where
                 let shared = self.shared.clone();
                 tokio::spawn(async move { Self::commit_chunk(shared, ckey).await });
             }
+
             guard = self.shared.inner.lock().await;
-            position += span.len as usize;
+            position += span_len;
         }
 
         drop(guard);
@@ -659,8 +823,26 @@ where
     }
 
     pub(crate) async fn clear(&self) {
+        let slices: Vec<Arc<ParkingMutex<SliceState>>> = {
+            let guard = self.shared.inner.lock().await;
+            guard
+                .chunks
+                .values()
+                .flat_map(|chunk| chunk.slices.iter().cloned())
+                .collect()
+        };
+
+        for slice in slices {
+            let freed = {
+                let mut guard = slice.lock();
+                guard.data.release_all()
+            };
+            self.shared.sub_usage(freed);
+        }
+
         let mut guard = self.shared.inner.lock().await;
         guard.chunks.clear();
+
         if guard.flush_waiting > 0 {
             self.shared.flush_notify.notify_waiters();
         }
@@ -674,83 +856,101 @@ where
     /// Spawn a background task to upload a frozen slice's data.
     /// Metadata commit is handled separately by commit_chunk.
     fn spawn_flush_slice(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
-        let handle = SliceHandle {
-            slice: &slice,
-            shared: &shared,
-        };
-        if !handle.start_uploading() {
-            return;
-        }
         Self::spawn_upload_task(shared, slice);
     }
 
     fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
         tokio::spawn(async move {
-            let handle = SliceHandle {
-                slice: &slice,
-                shared: &shared,
-            };
-            let snapshot = match handle.snapshot_for_flush() {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => {
-                    handle.mark_uploaded();
-                    return;
-                }
-                Err(err) => {
-                    handle.mark_failed(err);
-                    return;
-                }
-            };
+            loop {
+                let handle = SliceHandle {
+                    slice: &slice,
+                    shared: &shared,
+                };
 
-            let (chunk_id, offset, data, slice_id) = snapshot;
-            let data_len: usize = data.iter().map(|b| b.len()).sum();
+                let plan = match handle.prepare_upload() {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!(error = ?err, "prepare_upload failed");
+                        handle.mark_failed(err);
+                        return;
+                    }
+                };
 
-            let sid = match slice_id {
-                Some(id) => id,
-                None => {
-                    let id = match shared.backend.meta().next_id(SLICE_ID_KEY).await {
-                        Ok(id) => id as u64,
-                        Err(err) => {
-                            handle.mark_failed(anyhow::anyhow!(err));
+                let UploadPlan {
+                    chunk_id,
+                    offset,
+                    data,
+                    slice_id,
+                    uploaded,
+                } = plan;
+
+                let mut all_chunks = Vec::new();
+                let mut data_len = 0;
+                let mut indices = Vec::new();
+
+                for (index, chunks) in data {
+                    indices.push(index);
+
+                    for chunk in chunks {
+                        data_len += chunk.len();
+                        all_chunks.push(chunk);
+                    }
+                }
+
+                let slice_id = match slice_id {
+                    Some(slice_id) => slice_id,
+                    None => match handle.shared.backend.meta().next_id(SLICE_ID_KEY).await {
+                        Ok(id) => {
+                            let id = id as u64;
+                            handle.set_slice_id(id);
+                            id
+                        }
+                        Err(e) => {
+                            handle.mark_failed(anyhow::anyhow!("Failed to get slice id: {e}"));
                             return;
                         }
-                    };
-                    handle.set_slice_id(id);
-                    id
-                }
-            };
+                    },
+                };
 
-            let uploader = DataUploader::new(shared.config.layout, chunk_id, &shared.backend);
-            let result = backoff(UPLOAD_MAX_RETRIES, || async {
-                match uploader.write_at_vectored(sid, offset, &data).await {
-                    Ok(_) => Ok(()),
+                let offset = offset + uploaded;
+
+                let uploader = DataUploader::new(shared.config.layout, chunk_id, &shared.backend);
+                let result = backoff(UPLOAD_MAX_RETRIES, || async {
+                    match uploader
+                        .write_at_vectored(slice_id, offset, &all_chunks)
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            warn!(
+                                chunk_id,
+                                slice_id,
+                                offset,
+                                len = data_len,
+                                error = ?err,
+                                "upload failed, retrying"
+                            );
+                            Err(MetaError::ContinueRetry)
+                        }
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(()) => handle.advance_upload(data_len as u64, indices),
                     Err(err) => {
                         warn!(
                             chunk_id,
-                            slice_id = sid,
+                            slice_id,
                             offset,
                             len = data_len,
                             error = ?err,
-                            "upload failed, retrying"
+                            "upload failed after retries"
                         );
-                        Err(MetaError::ContinueRetry)
+                        handle.mark_failed(anyhow::anyhow!(err));
+                        return;
                     }
-                }
-            })
-            .await;
-
-            match result {
-                Ok(()) => handle.mark_uploaded(),
-                Err(err) => {
-                    warn!(
-                        chunk_id,
-                        slice_id = sid,
-                        offset,
-                        len = data_len,
-                        error = ?err,
-                        "upload failed after retries"
-                    );
-                    handle.mark_failed(anyhow::anyhow!(err))
                 }
             }
         });
@@ -759,6 +959,7 @@ where
     /// The background thread for committing a chunk.
     /// It waits for Uploaded slices, appends metadata, and marks them Committed.
     /// Each chunk will have a unique committing thread.
+    #[tracing::instrument(level = "trace", skip(shared), fields(chunk_id))]
     async fn commit_chunk(shared: Arc<Shared<B, M>>, chunk_id: u64) {
         loop {
             let slice = {
@@ -774,9 +975,11 @@ where
             let Some(slice) = slice else {
                 let mut guard = shared.inner.lock().await;
                 guard.chunks.remove(&chunk_id);
+
                 if !guard.has_chunks() && guard.flush_waiting > 0 {
                     shared.flush_notify.notify_waiters();
                 }
+
                 return;
             };
 
@@ -791,12 +994,15 @@ where
 
             if matches!(runtime.status, SliceStatus::Failed) {
                 Self::spawn_flush_slice(shared.clone(), slice.clone());
-                tokio::time::sleep(COMMIT_WAIT_SLICE).await;
+                tokio::time::sleep(COMMIT_WAIT_SLICE)
+                    .instrument(tracing::trace_span!("commit_chunk.wait_retry"))
+                    .await;
                 continue;
             }
 
             if !runtime.upload_done() {
                 if timeout(COMMIT_WAIT_SLICE, runtime.notify.notified())
+                    .instrument(tracing::trace_span!("commit_chunk.wait_upload"))
                     .await
                     .is_ok()
                 {
@@ -805,12 +1011,16 @@ where
 
                 // If the slice is too old, it will be frozen and flushed.
                 if !runtime.frozen && runtime.started.elapsed() > FLUSH_DURATION * 2 {
+                    let _span = tracing::trace_span!("commit_chunk.freeze").entered();
                     let froze = SliceHandle {
                         slice: &slice,
                         shared: &shared,
                     }
                     .freeze();
+
                     if froze {
+                        let _spawn_span =
+                            tracing::trace_span!("commit_chunk.spawn_flush").entered();
                         Self::spawn_flush_slice(shared.clone(), slice.clone());
                     }
                 }
@@ -827,25 +1037,52 @@ where
                 .desc_for_commit();
 
                 if let Some(desc) = desc {
-                    let ok = shared
+                    let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
+                    let file_offset = chunk_index * shared.config.layout.chunk_size + desc.offset;
+                    let new_size = file_offset + desc.length;
+
+                    let result = shared
                         .backend
                         .meta()
-                        .append_slice(desc.chunk_id, desc)
-                        .await
-                        .is_ok();
-                    if ok {
+                        .write(ino, desc.chunk_id, desc, new_size)
+                        .instrument(tracing::trace_span!(
+                            "commit_chunk.meta_write",
+                            ino,
+                            chunk_id = desc.chunk_id,
+                            slice_id = desc.slice_id,
+                            offset = desc.offset,
+                            len = desc.length,
+                            new_size
+                        ))
+                        .await;
+
+                    if let Err(err) = result {
+                        warn!(
+                            ino,
+                            chunk_id = desc.chunk_id,
+                            slice_id = desc.slice_id,
+                            offset = desc.offset,
+                            len = desc.length,
+                            new_size,
+                            error = ?err,
+                            "commit_chunk meta write failed, retrying"
+                        );
+                    } else {
                         SliceHandle {
                             slice: &slice,
                             shared: &shared,
                         }
                         .mark_committed();
 
-                        let (ino, chunk_index) = extract_ino_and_chunk_index(desc.chunk_id);
-                        let file_offset =
-                            chunk_index * shared.config.layout.chunk_size + desc.offset as u64;
                         let _ = shared
                             .reader
-                            .invalidate(ino as u64, file_offset, desc.length as usize)
+                            .invalidate(ino as u64, file_offset, desc.length.as_usize())
+                            .instrument(tracing::trace_span!(
+                                "commit_chunk.invalidate",
+                                ino,
+                                offset = file_offset,
+                                len = desc.length
+                            ))
                             .await;
                         should_pop = true;
                     }
@@ -857,11 +1094,22 @@ where
             }
 
             if !should_pop {
-                tokio::time::sleep(COMMIT_WAIT_SLICE).await;
+                tracing::trace!(
+                    status = ?runtime.status,
+                    err = ?runtime.err,
+                    "commit_chunk retrying"
+                );
+                tokio::time::sleep(COMMIT_WAIT_SLICE)
+                    .instrument(tracing::trace_span!("commit_chunk.wait_retry"))
+                    .await;
                 continue;
             }
 
-            let mut guard = shared.inner.lock().await;
+            let mut guard = shared
+                .inner
+                .lock()
+                .instrument(tracing::trace_span!("commit_chunk.pop_lock"))
+                .await;
             if let Some(chunk) = guard.chunks.get_mut(&chunk_id) {
                 let _ = chunk.slices.pop_front();
             }
@@ -924,7 +1172,7 @@ where
                             (
                                 now.duration_since(s.started),
                                 now.duration_since(s.last_mod),
-                                matches!(s.state, SliceStatus::Writeable),
+                                matches!(s.state, SliceStatus::Writable),
                             )
                         });
 
@@ -963,6 +1211,7 @@ pub(crate) struct DataWriter<B, M> {
     backend: Arc<Backend<B, M>>,
     reader: Arc<DataReader<B, M>>,
     files: DashMap<u64, Arc<FileWriter<B, M>>>,
+    buffer_usage: Arc<AtomicU64>,
 }
 
 impl<B, M> DataWriter<B, M>
@@ -980,6 +1229,7 @@ where
             backend,
             reader,
             files: DashMap::new(),
+            buffer_usage: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -992,6 +1242,7 @@ where
                     self.config.clone(),
                     self.backend.clone(),
                     self.reader.clone(),
+                    self.buffer_usage.clone(),
                 ))
             })
             .clone()
@@ -1000,6 +1251,7 @@ where
     pub(crate) fn start_flush_background(self: &Arc<Self>) {
         let flush_interval = self.config.flush_all_interval;
         let weak = Arc::downgrade(self);
+
         tokio::spawn(async move {
             let mut ticker = interval(flush_interval);
             loop {
@@ -1037,6 +1289,7 @@ where
         self.files.contains_key(&ino)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn flush_once(&self) {
         let writers: Vec<Arc<FileWriter<B, M>>> = self
             .files
@@ -1058,14 +1311,21 @@ mod tests {
     use crate::chuck::ChunkLayout;
     use crate::chuck::reader::DataFetcher;
     use crate::chuck::store::{BlockKey, BlockStore, InMemoryBlockStore};
+    use crate::meta::MetaLayer;
     use crate::meta::factory::create_meta_store_from_url;
     use crate::vfs::config::ReadConfig;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::time::{sleep, timeout};
 
     fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
         Arc::new(WriteConfig::new(layout).page_size(4 * 1024))
+    }
+
+    fn blocks_len(data: &[(usize, Vec<Bytes>)]) -> usize {
+        data.iter()
+            .map(|(_, pages)| pages.iter().map(|b| b.len()).sum::<usize>())
+            .sum()
     }
 
     struct BlockingStore {
@@ -1094,7 +1354,7 @@ mod tests {
         async fn write_range(
             &self,
             key: BlockKey,
-            offset: u32,
+            offset: u64,
             data: &[u8],
         ) -> anyhow::Result<u64> {
             while self.blocked.load(Ordering::Acquire) {
@@ -1106,15 +1366,67 @@ mod tests {
         async fn read_range(
             &self,
             key: BlockKey,
-            offset: u32,
+            offset: u64,
             buf: &mut [u8],
         ) -> anyhow::Result<()> {
             self.inner.read_range(key, offset, buf).await
         }
 
-        async fn delete_range(&self, key: BlockKey, len: usize) -> anyhow::Result<()> {
+        async fn delete_range(&self, key: BlockKey, len: u64) -> anyhow::Result<()> {
             self.inner.delete_range(key, len).await
         }
+    }
+
+    #[test]
+    fn test_idx_need_upload_writable_only_full_blocks() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let mut slice = SliceState::new(1, 0, test_config(layout));
+        let len = layout.block_size as usize + (layout.block_size as usize / 2);
+        slice.data.append(&vec![1u8; len]).unwrap();
+
+        let (start, end) = slice.idx_need_upload();
+        assert_eq!((start, end), (0, 1));
+    }
+
+    #[test]
+    fn test_idx_need_upload_readonly_includes_partial_block() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let mut slice = SliceState::new(1, 0, test_config(layout));
+        let len = layout.block_size as usize + (layout.block_size as usize / 2);
+        let data = vec![2u8; len];
+        slice.data.append(&data).unwrap();
+        slice.data.freeze();
+        slice.state = SliceStatus::Readonly;
+
+        let (start, end) = slice.idx_need_upload();
+        assert_eq!((start, end), (0, 2));
+
+        let blocks = slice.data.collect_pages(start, end).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks_len(&blocks), data.len());
+    }
+
+    #[test]
+    fn test_uploaded_blocks_reject_overwrite() {
+        let layout = ChunkLayout {
+            chunk_size: 16 * 1024,
+            block_size: 4 * 1024,
+        };
+        let mut slice = SliceState::new(1, 0, test_config(layout));
+        slice
+            .data
+            .append(&vec![0u8; layout.block_size as usize * 2])
+            .unwrap();
+        slice.uploaded = layout.block_size as u64;
+
+        assert!(slice.can_write(0, 16).is_none());
+        assert!(slice.can_write(layout.block_size as u64, 16).is_some());
     }
 
     #[tokio::test]
@@ -1126,12 +1438,22 @@ mod tests {
             .unwrap()
             .layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
-        let inode = Inode::new(11, 0);
+        let ino = meta
+            .create_file(1, "flush_reads.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
         let reader = Arc::new(DataReader::new(
             Arc::new(ReadConfig::new(layout)),
             backend.clone(),
         ));
-        let writer = FileWriter::new(inode.clone(), test_config(layout), backend.clone(), reader);
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
 
         let len = (layout.block_size / 2) as usize;
         let mut data = vec![0u8; len];
@@ -1163,12 +1485,22 @@ mod tests {
             .unwrap()
             .layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
-        let inode = Inode::new(22, 0);
+        let ino = meta
+            .create_file(1, "overwrite.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
         let reader = Arc::new(DataReader::new(
             Arc::new(ReadConfig::new(layout)),
             backend.clone(),
         ));
-        let writer = FileWriter::new(inode.clone(), test_config(layout), backend.clone(), reader);
+        let writer = FileWriter::new(
+            inode.clone(),
+            test_config(layout),
+            backend.clone(),
+            reader,
+            Arc::new(AtomicU64::new(0)),
+        );
 
         let len = (layout.block_size / 4) as usize;
         let first = vec![1u8; len];
@@ -1181,7 +1513,7 @@ mod tests {
 
         let cid = chunk_id_for(inode.ino(), 0);
         let slices = meta.get_slices(cid).await.unwrap();
-        assert_eq!(slices.len(), 2);
+        assert_eq!(slices.len(), 1);
 
         let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
         reader.prepare_slices().await.unwrap();
@@ -1201,7 +1533,11 @@ mod tests {
             .unwrap()
             .layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
-        let inode = Inode::new(33, 0);
+        let ino = meta
+            .create_file(1, "cross_chunks.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
 
         let reader_cfg = Arc::new(ReadConfig::new(layout));
         let reader = Arc::new(DataReader::new(reader_cfg, backend.clone()));
@@ -1210,6 +1546,7 @@ mod tests {
             test_config(layout),
             backend.clone(),
             reader.clone(),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let len = layout.chunk_size as usize + 1024;
@@ -1238,7 +1575,11 @@ mod tests {
             .unwrap()
             .layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
-        let inode = Inode::new(44, 0);
+        let ino = meta
+            .create_file(1, "flush_blocking.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
 
         let reader = Arc::new(DataReader::new(
             Arc::new(ReadConfig::new(layout)),
@@ -1249,6 +1590,7 @@ mod tests {
             test_config(layout),
             backend.clone(),
             reader,
+            Arc::new(AtomicU64::new(0)),
         ));
 
         let data = vec![3u8; 2048];
@@ -1308,7 +1650,11 @@ mod tests {
         let writer_pool = Arc::new(DataWriter::new(write_cfg, backend.clone(), reader));
         writer_pool.start_flush_background();
 
-        let inode = Inode::new(55, 0);
+        let ino = meta
+            .create_file(1, "background_flush.txt".to_string())
+            .await
+            .unwrap();
+        let inode = Inode::new(ino, 0);
         let writer = writer_pool.ensure_file(inode.clone());
         let data = vec![7u8; 1024];
         writer.write_at(0, &data).await.unwrap();

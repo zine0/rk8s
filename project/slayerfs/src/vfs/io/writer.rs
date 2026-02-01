@@ -16,13 +16,13 @@ use crate::meta::backoff::backoff;
 use crate::meta::store::MetaError;
 use crate::meta::{MetaLayer, SLICE_ID_KEY};
 use crate::utils::NumCastExt;
+use crate::vfs::Inode;
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::page::CacheSlice;
 use crate::vfs::cache::page::WriteAction as PageWriteAction;
 use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
-use crate::vfs::inode::Inode;
 use crate::vfs::io::split_chunk_spans;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -719,7 +719,7 @@ where
 
         let spans = split_chunk_spans(self.shared.config.layout, offset, buf.len());
         for span in spans {
-            let cid = chunk_id_for(self.shared.inode.ino(), span.index);
+            let cid = chunk_id_for(self.shared.inode.ino(), span.index)?;
             let ckey = guard.get_or_create_chunk(cid);
 
             let mut handle = guard.chunk_handle(&self.shared, ckey);
@@ -1313,6 +1313,8 @@ mod tests {
     use crate::chuck::store::{BlockKey, BlockStore, InMemoryBlockStore};
     use crate::meta::MetaLayer;
     use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::store::MetaStore;
+    use crate::vfs::Inode;
     use crate::vfs::config::ReadConfig;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1433,10 +1435,9 @@ mod tests {
     async fn test_file_writer_flush_commits_and_reads() {
         let layout = ChunkLayout::default();
         let store = Arc::new(InMemoryBlockStore::new());
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap()
-            .layer();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let ino = meta
             .create_file(1, "flush_reads.txt".to_string())
@@ -1466,8 +1467,8 @@ mod tests {
 
         assert!(inode.file_size() >= len as u64);
 
-        let cid = chunk_id_for(inode.ino(), 0);
-        let slices = meta.get_slices(cid).await.unwrap();
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
+        let slices = meta_store.get_slices(cid).await.unwrap();
         assert_eq!(slices.len(), 1);
 
         let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
@@ -1480,10 +1481,9 @@ mod tests {
     async fn test_file_writer_appends_slices_for_overwrite() {
         let layout = ChunkLayout::default();
         let store = Arc::new(InMemoryBlockStore::new());
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap()
-            .layer();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let ino = meta
             .create_file(1, "overwrite.txt".to_string())
@@ -1511,8 +1511,8 @@ mod tests {
 
         writer.flush().await.unwrap();
 
-        let cid = chunk_id_for(inode.ino(), 0);
-        let slices = meta.get_slices(cid).await.unwrap();
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
+        let slices = meta_store.get_slices(cid).await.unwrap();
         assert_eq!(slices.len(), 1);
 
         let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
@@ -1528,10 +1528,9 @@ mod tests {
             block_size: 4 * 1024,
         };
         let store = Arc::new(InMemoryBlockStore::new());
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap()
-            .layer();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let _meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let ino = meta
             .create_file(1, "cross_chunks.txt".to_string())
@@ -1570,10 +1569,9 @@ mod tests {
             block_size: 4 * 1024,
         };
         let store = Arc::new(BlockingStore::new(true));
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap()
-            .layer();
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let _meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let ino = meta
             .create_file(1, "flush_blocking.txt".to_string())
@@ -1631,12 +1629,11 @@ mod tests {
             chunk_size: 8 * 1024,
             block_size: 4 * 1024,
         };
-        let store = Arc::new(InMemoryBlockStore::new());
-        let meta = create_meta_store_from_url("sqlite::memory:")
-            .await
-            .unwrap()
-            .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
+        let block_store = Arc::new(InMemoryBlockStore::new());
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta_store = meta_handle.store();
+        let meta = meta_handle.layer();
+        let backend = Arc::new(Backend::new(block_store.clone(), meta.clone()));
 
         let reader = Arc::new(DataReader::new(
             Arc::new(ReadConfig::new(layout)),
@@ -1659,10 +1656,10 @@ mod tests {
         let data = vec![7u8; 1024];
         writer.write_at(0, &data).await.unwrap();
 
-        let cid = chunk_id_for(inode.ino(), 0);
+        let cid = chunk_id_for(inode.ino(), 0).unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if !meta.get_slices(cid).await.unwrap().is_empty() {
+                if !meta_store.get_slices(cid).await.unwrap().is_empty() {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;

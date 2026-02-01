@@ -9,11 +9,12 @@ use std::{
 
 use anyhow::anyhow;
 use dirs::cache_dir;
-use sea_orm::sea_query::WindowSelectType;
 use sha2::{Digest, Sha256, digest::KeyInit};
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
+
+const REQUEST_WINDOW_BUCKETS: usize = 60; // 1-minute sliding window (1 sec per bucket)
 
 #[derive(Debug)]
 struct AccessStats {
@@ -329,7 +330,6 @@ impl AccessStats {
 ///     threshold *= 1.3;
 /// }
 /// ```
-///
 /// # Implementation Notes
 ///
 /// All metrics are stored as scaled integers to avoid floating-point operations
@@ -367,7 +367,7 @@ struct SystemMetrics {
     /// **Purpose**: Track requests in recent time window to compute true request rate
     /// **Implementation**: Fixed-size circular buffer with time buckets
     /// **Benefit**: Prevents permanent drift in load calculation
-    request_buckets: [AtomicU64; 60], // 60 buckets for 1-minute sliding window
+    request_buckets: [AtomicU64; REQUEST_WINDOW_BUCKETS],
     current_request_bucket: AtomicU64,
     last_request_advance: AtomicU64,
 }
@@ -471,7 +471,13 @@ impl SystemMetrics {
             let rate = hits
                 .checked_mul(10000)
                 .and_then(|value| value.checked_div(total))
-                .unwrap_or(0); // Scale to 0-10000 for 0.0-1.0
+                .unwrap_or_else(|| {
+                    warn!(
+                        "Hit rate calculation overflow: hits={}, total={}",
+                        hits, total
+                    );
+                    0
+                });
             self.hit_rate.store(rate, Ordering::Relaxed);
         }
     }

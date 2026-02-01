@@ -18,6 +18,7 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::RwLock,
 };
+use tracing::{info, warn};
 
 /// Abstract block store interface (cadapter/S3/etc. can implement this).
 #[async_trait]

@@ -17,7 +17,7 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::RwLock,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Abstract block store interface (cadapter/S3/etc. can implement this).
 #[async_trait]
@@ -375,7 +375,9 @@ impl<B: ObjectBackend + Send + Sync> BlockStore for ObjectBlockStore<B> {
 
         let block_cache = self.block_cache.clone();
         tokio::spawn(async move {
-            let _ = block_cache.insert(&cache_key, &block).await;
+            if let Err(e) = block_cache.insert(&cache_key, &block).await {
+                warn!("Failed to insert block into cache: {}", e);
+            }
         });
         Ok(())
     }

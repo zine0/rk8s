@@ -10,21 +10,24 @@ use std::{
 use dirs::cache_dir;
 use tracing::{debug, info, trace, warn};
 
-use crate::chuck::chunk_cache::{disk_storage::DiskStorage, policy::Policy};
+use crate::chuck::chunk_cache::{
+    disk_storage::{self, DiskStorage},
+    policy::Policy,
+};
 
 #[derive(Debug, Clone)]
 pub struct ChunksCacheConfig {
-    /// Maximum number of entries in hot cache (fastest access tier)
+    /// Maximum number of bytes in hot cache (fastest access tier)
     ///
-    /// **Recommended**: 512-2048 depending on available memory
+    /// **Recommended**: 100MB-500MB depending on available memory
     /// **Impact**: Higher values = more hot data but more memory usage
-    pub hot_cache_size: usize,
+    pub hot_cache_max_bytes: usize,
 
-    /// Maximum number of entries in cold cache (metadata tracking tier)
+    /// Maximum number of bytes in cold cache (metadata tracking tier)
     ///
-    /// **Recommended**: Same as hot_cache_size or 2x for comprehensive tracking
+    /// **Recommended**: Same as hot_cache_max_bytes or 2x for comprehensive tracking
     /// **Impact**: Higher values = better access pattern visibility but more metadata overhead
-    pub cold_cache_size: usize,
+    pub cold_cache_max_bytes: usize,
 
     /// Base access frequency threshold for promoting items to hot cache
     ///
@@ -100,8 +103,8 @@ pub struct ChunksCacheConfig {
 impl Default for ChunksCacheConfig {
     fn default() -> Self {
         Self {
-            hot_cache_size: 1024,
-            cold_cache_size: 1024,
+            hot_cache_max_bytes: 100 * 1024 * 1024,
+            cold_cache_max_bytes: 100 * 1024 * 1024,
             base_promotion_threshold: 10.0,
             short_window_size: Duration::from_secs(10),
             medium_window_size: Duration::from_secs(60),
@@ -125,9 +128,6 @@ pub struct ChunksCache {
     /// Uses Moka's high-performance concurrent cache implementation
     hot_cache: moka::future::Cache<String, Vec<u8>>,
 
-    /// Approximate hot cache bytes (sum of Vec<u8> lengths)
-    hot_bytes: Arc<AtomicU64>,
-
     /// Cold cache tier tracking all accessed keys for pattern analysis
     /// Stores empty tuples () as lightweight metadata markers
     cold_cache: moka::future::Cache<String, usize>,
@@ -150,7 +150,9 @@ impl ChunksCache {
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
         info!(
             "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
-            config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
+            config.hot_cache_max_bytes,
+            config.cold_cache_max_bytes,
+            config.base_promotion_threshold
         );
 
         let cache_dir = config
@@ -164,7 +166,7 @@ impl ChunksCache {
         let hot_bytes_evict = hot_bytes.clone();
         let hot_cache_builder = moka::future::Cache::builder()
             .weigher(|_: &String, v: &Vec<u8>| v.len() as u32)
-            .max_capacity(config.hot_cache_size as u64)
+            .max_capacity(config.hot_cache_max_bytes as u64)
             .time_to_idle(Duration::from_secs(30))
             .time_to_live(Duration::from_secs(120))
             .eviction_listener(move |_key, value: Vec<u8>, _cause| {
@@ -172,7 +174,7 @@ impl ChunksCache {
             });
         let cold_cache_builder = moka::future::Cache::builder()
             .weigher(|_: &String, v: &usize| *v as u32)
-            .max_capacity(config.cold_cache_size as u64)
+            .max_capacity(config.cold_cache_max_bytes as u64)
             .time_to_idle(Duration::from_secs(30))
             .time_to_live(Duration::from_secs(120));
 
@@ -196,7 +198,6 @@ impl ChunksCache {
         Ok(Self {
             disk_storage,
             hot_cache: hot_cache_builder.build(),
-            hot_bytes,
             cold_cache: cold_cache_builder.build(),
             policy,
             config,
@@ -225,13 +226,15 @@ impl ChunksCache {
         let diskstorage = self.disk_storage.clone();
         let policy = self.policy.clone();
         let hot_cache = self.hot_cache.clone();
-        let hot_bytes = self.hot_bytes.clone();
         // ensure key exists in cold cache
         self.cold_cache.get(key).await?;
 
         let load_future = async move {
             trace!("Loading data from disk for key: {}", key);
-            let value = diskstorage.load(key).await.ok().unwrap_or_default();
+            let value = diskstorage.load(key).await.unwrap_or_else(|e| {
+                debug!("Disk load failed for key {}: {}", key, e);
+                Vec::new()
+            });
 
             if value.is_empty() {
                 warn!("No data found on disk for key: {}", key);
@@ -243,7 +246,6 @@ impl ChunksCache {
             if policy.should_promote(key).await {
                 debug!("Promoting key to hot cache: {}", key);
                 hot_cache.insert(key.clone(), value.clone()).await;
-                hot_bytes.fetch_add(value.len() as u64, Ordering::Relaxed);
             } else {
                 trace!("Key not eligible for promotion: {}", key);
             }
@@ -267,33 +269,42 @@ impl ChunksCache {
     /// Update cache utilization metrics
     fn update_utilization_metrics(&self) {
         let current_size = self.hot_cache.entry_count();
-        let max_size = self.config.hot_cache_size as u64;
-        let bytes = self.hot_bytes.load(Ordering::Relaxed);
+        let max_size = self.config.hot_cache_max_bytes as u64;
         trace!(
             "Updating cache utilization: {}/{} entries, {} MB hot bytes",
             current_size,
             max_size,
-            bytes / 1024 / 1024
+            self.hot_cache.weighted_size() / 1024 / 1024
         );
         self.policy.update_cache_utilization(current_size, max_size);
     }
 
-    pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
+    pub async fn insert(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         info!(
             "Cache INSERT request for key: {}, size: {} bytes",
             key,
             data.len()
         );
         trace!("Inserting into hot cache: {}", key);
-        self.hot_cache.insert(key.to_owned(), data.clone()).await;
-        self.hot_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.hot_cache.insert(key.to_owned(), data.to_owned()).await;
 
-        trace!("Storing on disk: {}", key);
-        self.disk_storage.store(key, data).await?;
+        let key_ownd = key.to_string();
+        let data = data.to_owned();
+        let disk_storage = self.disk_storage.clone();
+        let cold_cache = self.cold_cache.clone();
 
-        trace!("Adding to cold cache: {}", key);
-        self.cold_cache.insert(key.to_owned(), data.len()).await;
+        tokio::spawn(async move {
+            trace!("Storing on disk: {}", key_ownd);
+            if let Err(e) = disk_storage.store(&key_ownd, &data).await {
+                {
+                    warn!("Failed to store in disk: {e}");
+                    return;
+                }
+            }
+
+            trace!("Adding to cold cache: {}", key_ownd);
+            cold_cache.insert(key_ownd.to_owned(), data.len()).await;
+        });
 
         debug!("Successfully inserted key: {}", key);
         Ok(())
@@ -304,7 +315,6 @@ impl ChunksCache {
         info!("Cache REMOVE request for key: {}", key);
         trace!("Invalidating from hot cache: {}", key);
         self.hot_cache.invalidate(key).await;
-        // self.disk_storage.remove(key).await?;
         trace!("Invalidating from cold cache: {}", key);
         self.cold_cache.invalidate(key).await;
 

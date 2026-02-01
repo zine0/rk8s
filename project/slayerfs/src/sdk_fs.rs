@@ -1240,9 +1240,9 @@ mod tests {
     use crate::fs::{CallerIdentity, FileSystemConfig};
     use crate::vfs::sdk::LocalClient;
     use futures::task::noop_waker;
+    use std::task::Context;
     use tempfile::tempdir;
     use tokio::sync::Notify;
-    use std::task::Context;
 
     async fn local_client() -> (tempfile::TempDir, Client) {
         let tmp = tempdir().expect("tempdir");
@@ -1377,9 +1377,11 @@ mod tests {
 
         let mut buf1 = [0u8; 8];
         let mut read_buf1 = ReadBuf::new(&mut buf1);
-        assert!(Pin::new(&mut file)
-            .poll_read(&mut cx, &mut read_buf1)
-            .is_pending());
+        assert!(
+            Pin::new(&mut file)
+                .poll_read(&mut cx, &mut read_buf1)
+                .is_pending()
+        );
 
         gate.notify_one();
 

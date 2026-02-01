@@ -1875,7 +1875,12 @@ where
     }
 
     /// Read data by file handle and offset.
-    #[tracing::instrument(level = "trace", skip(self), fields(fh, offset, len))]
+    #[tracing::instrument(
+        name = "VFS.read",
+        level = "trace",
+        skip(self),
+        fields(fh, offset, len)
+    )]
     pub async fn read(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
         if len == 0 {
             return Ok(Vec::new());
@@ -1953,12 +1958,6 @@ where
             .await
             .map_err(VfsError::from)?;
 
-        let target_size = offset + written as u64;
-        self.core
-            .meta_layer
-            .extend_file_size(ino, target_size)
-            .await
-            .map_err(VfsError::from)?;
         self.state.modified.touch(ino).await;
         Ok(written)
     }

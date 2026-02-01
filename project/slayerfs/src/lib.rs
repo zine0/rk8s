@@ -29,14 +29,14 @@ pub use crate::chuck::chunk::ChunkLayout;
 pub use crate::chuck::store::{BlockKey, BlockStore, InMemoryBlockStore, ObjectBlockStore};
 pub use crate::meta::client::MetaClient;
 pub use crate::meta::config::{CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType};
-pub use crate::meta::{
-    create_meta_store_from_url, create_redis_meta_store_from_url, MetaHandle, MetaStore,
-};
 pub use crate::meta::factory::MetaStoreFactory;
-pub use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
 pub use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 pub use crate::meta::store::{
     DirEntry as VfsDirEntry, FileAttr as VfsFileAttr, FileType as VfsFileType, SetAttrFlags,
     SetAttrRequest, StatFsSnapshot,
+};
+pub use crate::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
+pub use crate::meta::{
+    MetaHandle, MetaStore, create_meta_store_from_url, create_redis_meta_store_from_url,
 };
 pub use crate::vfs::fs::{RenameFlags, VFS};

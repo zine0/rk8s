@@ -119,6 +119,7 @@ impl Default for ChunksCacheConfig {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ChunksCache {
     /// Persistent disk storage backend with SHA256-based file naming
@@ -139,6 +140,7 @@ pub struct ChunksCache {
     config: ChunksCacheConfig,
 }
 
+#[allow(dead_code)]
 impl ChunksCache {
     /// Creates a new ChunksCache with default configuration
     #[allow(dead_code)]

@@ -15,6 +15,7 @@ use tokio::runtime::{Builder, Runtime};
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use bytes::Bytes;
 use slayerfs::{
     BlockKey, BlockStore, CacheConfig, ChunkLayout, ClientOptions, Config, DatabaseConfig,
     DatabaseMetaStore, DatabaseType, EtcdMetaStore, LocalFsBackend, MetaClient, MetaStore,
@@ -41,8 +42,11 @@ fn init_tracing(chrome_trace: Option<&Path>) {
                 .include_args(true)
                 .trace_style(TraceStyle::Async)
                 .build();
-            let guard_cell = CHROME_GUARD.get_or_init(|| Mutex::new(None));
-            *guard_cell.lock().unwrap() = Some(guard);
+            CHROME_GUARD
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("lock chrome guard")
+                .replace(guard);
             eprintln!("[slayerfs_bench] Chrome trace enabled: {}", path.display());
             tracing_subscriber::registry()
                 .with(filter)

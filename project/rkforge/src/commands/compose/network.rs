@@ -175,6 +175,7 @@ impl Default for CliNetworkConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct NetworkManager {
     map: HashMap<String, NetworkSpec>,
     /// key: network_name; value: bridge interface

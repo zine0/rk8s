@@ -33,6 +33,7 @@ pub mod container;
 pub mod deployment;
 pub mod pod;
 pub mod replicaset;
+pub mod service;
 pub mod volume;
 
 pub(crate) fn format_duration(duration: chrono::Duration) -> String {

@@ -47,7 +47,7 @@ jobs:
         run: |
           cd project
           cargo test -p slayerfs
-
+          
       - name: Install nightly toolchain and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -83,3 +83,48 @@ jobs:
           cd project/slayerfs
           rm -rf fuzz/artifacts/fs_ops/*
           rm -rf fuzz/.tmp*
+          
+  xfstests:
+    name: xfstests
+    if: false
+    runs-on: [self-hosted]
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libfuse3-dev fuse3 sqlite3 protobuf-compiler
+          protoc --version
+
+      - name: Build slayerfs persistence demo
+        working-directory: project
+        run: cargo build -p slayerfs --example persistence_demo --release
+
+      - name: Run xfstests
+        run: |
+          chmod +x project/slayerfs/tests/scripts/xfstests_slayer.sh
+          project/slayerfs/tests/scripts/xfstests_slayer.sh
+
+      - name: Upload xfstests artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slayerfs-xfstests-logs
+          path: |
+            /tmp/slayerfs.log
+            /tmp/xfstests-dev/results
+            /tmp/xfstests-dev/local.config
+          if-no-files-found: ignore

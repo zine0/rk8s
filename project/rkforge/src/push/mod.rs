@@ -43,14 +43,14 @@ pub struct PushArgs {
 pub fn push(args: PushArgs) -> anyhow::Result<()> {
     let auth_config = AuthConfig::load()?;
     let requested_has_explicit_tag = has_explicit_tag(&args.image_ref);
+    let requested_repo = strip_explicit_tag(&args.image_ref).to_string();
 
-    let requested_ref = args.image_ref.parse::<Reference>().with_context(|| {
+    args.image_ref.parse::<Reference>().with_context(|| {
         format!(
             "invalid image reference for push: {}",
             args.image_ref.as_str()
         )
     })?;
-    let requested_repo = requested_ref.repository().to_string();
 
     let url = auth_config.resolve_url(args.url);
 
@@ -206,8 +206,9 @@ fn should_include_digest(requested_tag: Option<&str>, ref_names: &[String]) -> b
 }
 
 fn has_explicit_tag(raw: &str) -> bool {
-    let last_colon = raw.rfind(':');
-    let last_slash = raw.rfind('/');
+    let raw_without_digest = raw.split_once('@').map(|(name, _)| name).unwrap_or(raw);
+    let last_colon = raw_without_digest.rfind(':');
+    let last_slash = raw_without_digest.rfind('/');
     match (last_colon, last_slash) {
         (Some(colon), Some(slash)) => colon > slash,
         (Some(_), None) => true,
@@ -215,9 +216,21 @@ fn has_explicit_tag(raw: &str) -> bool {
     }
 }
 
+fn strip_explicit_tag(raw: &str) -> &str {
+    let raw_without_digest = raw.split_once('@').map(|(name, _)| name).unwrap_or(raw);
+    if has_explicit_tag(raw)
+        && let Some(idx) = raw_without_digest.rfind(':')
+    {
+        return &raw_without_digest[..idx];
+    }
+    raw_without_digest
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{has_explicit_tag, should_include_digest};
+    use crate::storage::parse_image_ref;
+
+    use super::{has_explicit_tag, should_include_digest, strip_explicit_tag};
 
     #[test]
     fn test_should_include_digest_for_explicit_tag() {
@@ -238,5 +251,31 @@ mod tests {
         assert!(!has_explicit_tag("localhost:5000/repo/app"));
         assert!(has_explicit_tag("repo/app:v1"));
         assert!(has_explicit_tag("localhost:5000/repo/app:v1"));
+        assert!(!has_explicit_tag("repo/app@sha256:1234"));
+        assert!(has_explicit_tag("repo/app:v1@sha256:1234"));
+    }
+
+    #[test]
+    fn test_strip_explicit_tag() {
+        assert_eq!(strip_explicit_tag("repo/app"), "repo/app");
+        assert_eq!(strip_explicit_tag("my.ns/team/app"), "my.ns/team/app");
+        assert_eq!(
+            strip_explicit_tag("localhost:5000/repo/app"),
+            "localhost:5000/repo/app"
+        );
+        assert_eq!(strip_explicit_tag("repo/app:v1"), "repo/app");
+        assert_eq!(
+            strip_explicit_tag("localhost:5000/repo/app:v1"),
+            "localhost:5000/repo/app"
+        );
+        assert_eq!(strip_explicit_tag("repo/app@sha256:1234"), "repo/app");
+        assert_eq!(strip_explicit_tag("repo/app:v1@sha256:1234"), "repo/app");
+    }
+
+    #[test]
+    fn test_implicit_push_repo_path_preserved() {
+        let ref_name = strip_explicit_tag("my.ns/team/app");
+        let target = parse_image_ref("127.0.0.1:8968", ref_name, Some("latest")).unwrap();
+        assert_eq!(target.repository(), "my.ns/team/app");
     }
 }

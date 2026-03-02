@@ -1,11 +1,10 @@
 [package]
 name = "libvault"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["rk8s-dev team"]
 description = "the libvault is modified from RustyVault"
-repository = "https://github.com/r2cn-dev/rk8s/tree/main/project/libvault"
-documentation = "https://docs.rs/rusty_vault/latest/rusty_vault/"
+repository = "https://github.com/rk8s-dev/rk8s/tree/main/project/libvault"
 build = "build.rs"
 license = "MIT OR Apache-2.0"
 
@@ -70,11 +69,13 @@ tonic = { workspace = true }
 openssl = { workspace = true, optional = true }
 openssl-sys = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-qlean = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]
 toml = { workspace = true }
+
+[dev-dependencies]
+qlean = { workspace = true }
 
 [features]
 default = ["crypto_adaptor_openssl"]

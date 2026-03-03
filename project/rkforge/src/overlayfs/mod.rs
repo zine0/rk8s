@@ -2,6 +2,9 @@ pub mod libfuse;
 pub mod linux;
 
 use crate::config::image::CONFIG;
+use crate::image::build_runtime::{
+    BuildHostEntry, BuildUlimit, BuildUlimitResource, BuildUlimitValue,
+};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose};
 use clap::Parser;
@@ -11,9 +14,11 @@ use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::AsFd;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub static DNS_CONFIG: &str = "/etc/resolv.conf";
+pub static HOSTS_CONFIG: &str = "/etc/hosts";
+pub static SHM_CONFIG: &str = "/dev/shm";
 pub static BIND_MOUNTS: [&str; 3] = ["/dev", "/proc", "/sys"];
 
 #[derive(Parser, Debug)]
@@ -442,12 +447,56 @@ pub struct UserSpec {
     pub gid: Option<u32>,
 }
 
+fn to_rlimit_value(value: BuildUlimitValue) -> libc::rlim_t {
+    match value {
+        BuildUlimitValue::Unlimited => libc::RLIM_INFINITY,
+        BuildUlimitValue::Value(v) => v as libc::rlim_t,
+    }
+}
+
+fn to_rlimit_resource(resource: BuildUlimitResource) -> libc::c_int {
+    match resource {
+        BuildUlimitResource::Core => libc::RLIMIT_CORE as libc::c_int,
+        BuildUlimitResource::Cpu => libc::RLIMIT_CPU as libc::c_int,
+        BuildUlimitResource::Data => libc::RLIMIT_DATA as libc::c_int,
+        BuildUlimitResource::Fsize => libc::RLIMIT_FSIZE as libc::c_int,
+        BuildUlimitResource::Nofile => libc::RLIMIT_NOFILE as libc::c_int,
+        BuildUlimitResource::Nproc => libc::RLIMIT_NPROC as libc::c_int,
+        BuildUlimitResource::Stack => libc::RLIMIT_STACK as libc::c_int,
+        BuildUlimitResource::As => libc::RLIMIT_AS as libc::c_int,
+        BuildUlimitResource::Memlock => libc::RLIMIT_MEMLOCK as libc::c_int,
+    }
+}
+
+fn apply_ulimits(ulimits: &[BuildUlimit]) -> Result<()> {
+    for ulimit in ulimits {
+        let lim = libc::rlimit {
+            rlim_cur: to_rlimit_value(ulimit.soft),
+            rlim_max: to_rlimit_value(ulimit.hard),
+        };
+
+        let ret = unsafe { libc::setrlimit(to_rlimit_resource(ulimit.resource) as _, &lim) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            bail!(
+                "Failed to set ulimit `{}` to soft={:?}, hard={:?}: {}",
+                ulimit.resource.as_name(),
+                ulimit.soft,
+                ulimit.hard,
+                err
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn do_exec<P: AsRef<Path>>(
     mountpoint: P,
     command_args: &[&str],
     envp: &[CString],
     working_dir: &str,
     user: Option<&str>,
+    ulimits: &[BuildUlimit],
 ) -> Result<()> {
     let mountpoint = mountpoint.as_ref();
     do_chroot(mountpoint)?;
@@ -467,6 +516,9 @@ pub fn do_exec<P: AsRef<Path>>(
             return Err(e).with_context(|| format!("Failed to chdir to {}", working_dir));
         }
     }
+
+    // Apply resource limits before switching user.
+    apply_ulimits(ulimits)?;
 
     // Resolve and switch user if specified.
     // IMPORTANT: User resolution happens AFTER chroot so that username/group lookups
@@ -559,10 +611,107 @@ pub fn bind_mount<P: AsRef<Path>>(mountpoint: P) -> Result<()> {
     Ok(())
 }
 
+fn runtime_temp_file(name: &str) -> PathBuf {
+    let mount_pid = std::env::var("MOUNT_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(std::process::id);
+    CONFIG.build_dir.join(format!("{name}.{mount_pid}"))
+}
+
+fn ensure_no_symlink_components(root: &Path, target: &Path) -> Result<()> {
+    let relative = target.strip_prefix(root).with_context(|| {
+        format!(
+            "Target path {} escapes mountpoint {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => current.push(part),
+            _ => {
+                bail!(
+                    "Target path {} contains unsupported component",
+                    target.display()
+                );
+            }
+        }
+
+        if let Ok(meta) = fs::symlink_metadata(&current)
+            && meta.file_type().is_symlink()
+        {
+            bail!(
+                "Refusing to use symlink in mount target path: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_target_file(root: &Path, path: &Path) -> Result<()> {
+    ensure_no_symlink_components(root, path)?;
+    if let Some(parent) = path.parent() {
+        ensure_no_symlink_components(root, parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    ensure_no_symlink_components(root, path)?;
+    if !path.exists() {
+        fs::write(path, b"").with_context(|| format!("Failed to create {}", path.display()))?;
+    } else {
+        let meta = fs::symlink_metadata(path)
+            .with_context(|| format!("Failed to inspect {}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Refusing to bind mount onto symlink target {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bind_mount_file(root: &Path, src: &Path, dst: &Path) -> Result<()> {
+    ensure_target_file(root, dst)?;
+    nix::mount::mount::<_, _, str, str>(Some(src), dst, None, nix::mount::MsFlags::MS_BIND, None)
+        .with_context(|| {
+            format!(
+                "Failed to bind mount {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })
+}
+
+fn read_hosts_template(mountpoint: &Path, target_hosts: &Path) -> Result<String> {
+    ensure_no_symlink_components(mountpoint, target_hosts)?;
+    if target_hosts.exists() {
+        fs::read_to_string(target_hosts)
+            .with_context(|| format!("Failed to read {}", target_hosts.display()))
+    } else {
+        Ok("127.0.0.1 localhost\n".to_string())
+    }
+}
+
+fn umount_if_mounted(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    match nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH) {
+        Ok(()) => Ok(()),
+        Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Failed to unmount {}", path.display())),
+    }
+}
+
 pub fn prepare_network<P: AsRef<Path>>(mountpoint: P) -> Result<()> {
     let mountpoint = mountpoint.as_ref();
-    // Create a temp `resolv.conf` file
-    let host_resolv_conf = CONFIG.build_dir.join("resolv.conf");
+    let host_resolv_conf = runtime_temp_file("resolv.conf");
     if host_resolv_conf.exists() {
         fs::remove_file(&host_resolv_conf)?;
     }
@@ -573,35 +722,100 @@ pub fn prepare_network<P: AsRef<Path>>(mountpoint: P) -> Result<()> {
         .with_context(|| format!("Failed to set ownership on {}", host_resolv_conf.display()))?;
 
     let target_resolv_conf = mountpoint.join(DNS_CONFIG.strip_prefix('/').unwrap());
+    bind_mount_file(mountpoint, &host_resolv_conf, &target_resolv_conf)?;
+
+    Ok(())
+}
+
+pub fn prepare_hosts<P: AsRef<Path>>(mountpoint: P, add_hosts: &[BuildHostEntry]) -> Result<()> {
+    if add_hosts.is_empty() {
+        return Ok(());
+    }
+
+    let mountpoint = mountpoint.as_ref();
+    let target_hosts = mountpoint.join(HOSTS_CONFIG.strip_prefix('/').unwrap());
+    let mut hosts_content = read_hosts_template(mountpoint, &target_hosts)?;
+
+    if !hosts_content.ends_with('\n') {
+        hosts_content.push('\n');
+    }
+    for item in add_hosts {
+        hosts_content.push_str(&format!("{}\t{}\n", item.ip, item.host));
+    }
+
+    let host_hosts_file = runtime_temp_file("hosts");
+    if host_hosts_file.exists() {
+        fs::remove_file(&host_hosts_file)?;
+    }
+    fs::write(&host_hosts_file, hosts_content)
+        .with_context(|| format!("Failed to write {}", host_hosts_file.display()))?;
+    let uid = getuid();
+    let gid = getgid();
+    chown(&host_hosts_file, Some(uid), Some(gid))
+        .with_context(|| format!("Failed to set ownership on {}", host_hosts_file.display()))?;
+
+    bind_mount_file(mountpoint, &host_hosts_file, &target_hosts)?;
+    Ok(())
+}
+
+pub fn prepare_shm<P: AsRef<Path>>(mountpoint: P, shm_size: Option<u64>) -> Result<()> {
+    let Some(shm_size) = shm_size else {
+        return Ok(());
+    };
+
+    let mountpoint = mountpoint.as_ref();
+    let target_shm = mountpoint.join(SHM_CONFIG.strip_prefix('/').unwrap());
+    fs::create_dir_all(&target_shm)
+        .with_context(|| format!("Failed to create {}", target_shm.display()))?;
+
+    let options = format!("size={shm_size},mode=1777");
     nix::mount::mount::<_, _, str, str>(
-        Some(&host_resolv_conf),
-        &target_resolv_conf,
-        None,
-        nix::mount::MsFlags::MS_BIND,
-        None,
+        Some("tmpfs"),
+        &target_shm,
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        Some(options.as_str()),
     )
     .with_context(|| {
         format!(
-            "Failed to bind mount {} to {}",
-            host_resolv_conf.display(),
-            target_resolv_conf.display()
+            "Failed to mount tmpfs on {} with options `{options}`",
+            target_shm.display()
         )
     })?;
-
     Ok(())
 }
 
 fn cleanup_network<P: AsRef<Path>>(mountpoint: P) -> Result<()> {
     let mountpoint = mountpoint.as_ref();
+    let target_shm = mountpoint.join(SHM_CONFIG.strip_prefix('/').unwrap());
+    umount_if_mounted(&target_shm)?;
+
+    let target_hosts = mountpoint.join(HOSTS_CONFIG.strip_prefix('/').unwrap());
+    umount_if_mounted(&target_hosts)?;
+
     let target_resolv_conf = mountpoint.join(DNS_CONFIG.strip_prefix('/').unwrap());
-    if target_resolv_conf.exists() {
-        nix::mount::umount2(&target_resolv_conf, nix::mount::MntFlags::MNT_DETACH)
-            .with_context(|| format!("Failed to unmount {}", target_resolv_conf.display()))?;
+    umount_if_mounted(&target_resolv_conf)?;
+
+    let host_hosts_file = runtime_temp_file("hosts");
+    if host_hosts_file.exists()
+        && let Err(err) = fs::remove_file(&host_hosts_file)
+    {
+        tracing::warn!(
+            error = ?err,
+            path = %host_hosts_file.display(),
+            "Failed to remove temporary hosts file during cleanup"
+        );
     }
 
-    let host_resolv_conf = CONFIG.build_dir.join("resolv.conf");
-    if host_resolv_conf.exists() {
-        fs::remove_file(&host_resolv_conf)?;
+    let host_resolv_conf = runtime_temp_file("resolv.conf");
+    if host_resolv_conf.exists()
+        && let Err(err) = fs::remove_file(&host_resolv_conf)
+    {
+        tracing::warn!(
+            error = ?err,
+            path = %host_resolv_conf.display(),
+            "Failed to remove temporary resolv.conf file during cleanup"
+        );
     }
     Ok(())
 }
@@ -633,9 +847,12 @@ pub fn cleanup(args: CleanupArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
     use tempfile::tempdir;
 
-    use super::MountConfig;
+    use super::{MountConfig, ensure_target_file, read_hosts_template};
 
     #[test]
     fn test_mount_config() {
@@ -661,5 +878,45 @@ mod tests {
         assert!(cfg.upper_dir.exists());
         assert!(cfg.mountpoint.exists());
         assert!(cfg.work_dir.exists());
+    }
+
+    #[test]
+    fn test_ensure_target_file_rejects_symlink_target() {
+        let root = tempdir().unwrap();
+        let etc_dir = root.path().join("etc");
+        fs::create_dir_all(&etc_dir).unwrap();
+
+        let real_file = root.path().join("real-hosts");
+        fs::write(&real_file, b"127.0.0.1 localhost\n").unwrap();
+        let symlink_target = etc_dir.join("hosts");
+        symlink(&real_file, &symlink_target).unwrap();
+
+        let err = ensure_target_file(root.path(), &symlink_target).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn test_ensure_target_file_rejects_outside_mountpoint() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_target = outside.path().join("hosts");
+
+        let err = ensure_target_file(root.path(), &outside_target).unwrap_err();
+        assert!(err.to_string().contains("escapes mountpoint"));
+    }
+
+    #[test]
+    fn test_read_hosts_template_rejects_symlink_target() {
+        let root = tempdir().unwrap();
+        let etc_dir = root.path().join("etc");
+        fs::create_dir_all(&etc_dir).unwrap();
+
+        let leaked = root.path().join("host-secret");
+        fs::write(&leaked, b"secret").unwrap();
+        let hosts = etc_dir.join("hosts");
+        symlink(&leaked, &hosts).unwrap();
+
+        let err = read_hosts_template(root.path(), &hosts).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
     }
 }

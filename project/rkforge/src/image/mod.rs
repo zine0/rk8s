@@ -1,17 +1,27 @@
+pub mod build_runtime;
 pub mod config;
 pub mod context;
 pub mod execute;
 pub mod executor;
+mod metadata;
 pub mod stage_executor;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::compressor::tar_gz_compressor::TarGzCompressor;
+use crate::image::build_runtime::{
+    BuildHostEntry, BuildNetworkMode, BuildUlimit, BuildUlimitResource, BuildUlimitValue,
+    normalize_cgroup_parent,
+};
 use crate::image::executor::Executor;
+use crate::image::metadata::{BuildMetadata, write_metadata_file};
+use crate::push::push_from_layout;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use dockerfile_parser::Dockerfile;
@@ -78,9 +88,177 @@ pub struct BuildArgs {
     #[arg(long, value_enum, default_value = "auto")]
     pub progress: BuildProgressMode,
 
+    /// Add a custom host-to-IP mapping (format: HOST:IP), can be set multiple times
+    #[arg(long = "add-host", value_name = "HOST:IP", value_parser = parse_add_host_option)]
+    pub add_hosts: Vec<BuildHostEntry>,
+
+    /// Shared memory size for build containers (e.g. 64m, 1g)
+    #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
+    pub shm_size: Option<u64>,
+
+    /// Ulimit options (format: NAME=SOFT:HARD), can be set multiple times
+    #[arg(long = "ulimit", value_name = "NAME=SOFT:HARD", value_parser = parse_ulimit_option)]
+    pub ulimits: Vec<BuildUlimit>,
+
+    /// Build result metadata output file (JSON)
+    #[arg(long = "metadata-file", value_name = "FILE")]
+    pub metadata_file: Option<PathBuf>,
+
+    /// Push image to registry after a successful build
+    #[arg(long)]
+    pub push: bool,
+
+    /// Set metadata annotation for OCI manifest descriptors (format: KEY=VALUE), can be set multiple times
+    #[arg(long = "annotation", value_name = "KEY=VALUE")]
+    pub annotations: Vec<String>,
+
+    /// Set networking mode for RUN instructions (default, none, host). In current single-node runtime, default behaves the same as host.
+    #[arg(long, value_enum, default_value = "default")]
+    pub network: BuildNetworkMode,
+
+    /// Set the parent cgroup for RUN instructions (requires cgroup v2 + sufficient privileges)
+    #[arg(long = "cgroup-parent", value_name = "PARENT")]
+    pub cgroup_parent: Option<String>,
+
+    /// Disable cache for specific stages by stage name or index (e.g. --no-cache-filter builder --no-cache-filter 0), can be set multiple times
+    #[arg(long = "no-cache-filter", value_name = "STAGE")]
+    pub no_cache_filter: Vec<String>,
+
     /// Build context. Defaults to the directory of the Dockerfile.
     #[arg(default_value = ".")]
     pub context: PathBuf,
+}
+
+fn parse_add_host_option(raw: &str) -> std::result::Result<BuildHostEntry, String> {
+    let (host, ip) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("invalid --add-host value `{raw}`: expected format HOST:IP"))?;
+
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(format!(
+            "invalid --add-host value `{raw}`: host must not be empty"
+        ));
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "invalid --add-host value `{raw}`: host must not contain spaces"
+        ));
+    }
+
+    let ip = ip.trim();
+    if ip.is_empty() {
+        return Err(format!(
+            "invalid --add-host value `{raw}`: IP must not be empty"
+        ));
+    }
+    let ip = ip
+        .parse::<IpAddr>()
+        .map_err(|e| format!("invalid --add-host value `{raw}`: invalid IP `{ip}`: {e}"))?;
+
+    Ok(BuildHostEntry {
+        host: host.to_string(),
+        ip,
+    })
+}
+
+fn parse_shm_size(raw: &str) -> std::result::Result<u64, String> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err("invalid --shm-size value: empty input".to_string());
+    }
+
+    let unit_start = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num_part, unit_part) = value.split_at(unit_start);
+
+    if num_part.is_empty() {
+        return Err(format!(
+            "invalid --shm-size value `{raw}`: expected positive number with optional unit"
+        ));
+    }
+
+    let number = num_part.parse::<u64>().map_err(|e| {
+        format!("invalid --shm-size value `{raw}`: invalid number `{num_part}`: {e}")
+    })?;
+    let multiplier = match unit_part {
+        "" | "b" => 1_u64,
+        "k" | "kb" | "ki" | "kib" => 1024_u64,
+        "m" | "mb" | "mi" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gi" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "ti" | "tib" => 1024_u64.pow(4),
+        "p" | "pb" | "pi" | "pib" => 1024_u64.pow(5),
+        _ => {
+            return Err(format!(
+                "invalid --shm-size value `{raw}`: unsupported unit `{unit_part}`"
+            ));
+        }
+    };
+
+    let size_bytes = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("invalid --shm-size value `{raw}`: value exceeds u64 range"))?;
+    if size_bytes == 0 {
+        return Err(format!(
+            "invalid --shm-size value `{raw}`: size must be greater than 0"
+        ));
+    }
+    Ok(size_bytes)
+}
+
+fn parse_ulimit_value(raw: &str, full_raw: &str) -> std::result::Result<BuildUlimitValue, String> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("unlimited") || raw.eq_ignore_ascii_case("infinity") {
+        return Ok(BuildUlimitValue::Unlimited);
+    }
+
+    let value = raw
+        .parse::<u64>()
+        .map_err(|e| format!("invalid --ulimit value `{full_raw}`: invalid limit `{raw}`: {e}"))?;
+    Ok(BuildUlimitValue::Value(value))
+}
+
+fn parse_ulimit_option(raw: &str) -> std::result::Result<BuildUlimit, String> {
+    let (name, limits) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --ulimit value `{raw}`: expected format NAME=SOFT:HARD"))?;
+
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return Err(format!(
+            "invalid --ulimit value `{raw}`: name must not be empty"
+        ));
+    }
+
+    let resource = BuildUlimitResource::from_name(&name)
+        .ok_or_else(|| format!("invalid --ulimit value `{raw}`: unsupported resource `{name}`"))?;
+
+    let (soft_raw, hard_raw) = limits
+        .split_once(':')
+        .ok_or_else(|| format!("invalid --ulimit value `{raw}`: expected format NAME=SOFT:HARD"))?;
+    let soft = parse_ulimit_value(soft_raw, raw)?;
+    let hard = parse_ulimit_value(hard_raw, raw)?;
+
+    match (soft, hard) {
+        (BuildUlimitValue::Unlimited, BuildUlimitValue::Value(_)) => {
+            return Err(format!(
+                "invalid --ulimit value `{raw}`: soft limit cannot be unlimited when hard limit is finite"
+            ));
+        }
+        (BuildUlimitValue::Value(soft), BuildUlimitValue::Value(hard)) if soft > hard => {
+            return Err(format!(
+                "invalid --ulimit value `{raw}`: soft limit must be <= hard limit"
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(BuildUlimit {
+        resource,
+        soft,
+        hard,
+    })
 }
 
 fn parse_dockerfile<P: AsRef<Path>>(dockerfile_path: P) -> Result<Dockerfile> {
@@ -189,6 +367,27 @@ fn write_iidfile<P: AsRef<Path>>(path: P, digest: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_cgroup_parent_option(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let normalized = normalize_cgroup_parent(raw)?;
+    Ok(Some(normalized.to_string_lossy().into_owned()))
+}
+
+fn normalize_no_cache_filters(filters: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for raw in filters {
+        let value = raw.trim();
+        if value.is_empty() {
+            bail!("invalid --no-cache-filter value: empty input");
+        }
+        normalized.push(value.to_string());
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Clone)]
 struct ParsedTag {
     repository: String,
@@ -289,11 +488,27 @@ fn unique_ref_names(parsed_tags: &[ParsedTag]) -> Vec<String> {
     uniq
 }
 
+fn normalize_push_reference(raw_tag: &str) -> String {
+    if has_explicit_tag(raw_tag) {
+        raw_tag.to_string()
+    } else {
+        format!("{raw_tag}:latest")
+    }
+}
+
 pub fn build_image(build_args: &BuildArgs) -> Result<()> {
+    if build_args.push && build_args.tags.is_empty() {
+        bail!("--push requires at least one -t/--tag");
+    }
+
+    let build_started_at = Instant::now();
     let dockerfile_path = resolve_dockerfile_path(build_args)?;
     let dockerfile = parse_dockerfile(&dockerfile_path)?;
     let cli_build_args = parse_key_value_options(&build_args.build_args, "--build-arg")?;
     let cli_labels = parse_key_value_options(&build_args.labels, "--label")?;
+    let cli_annotations = parse_key_value_options(&build_args.annotations, "--annotation")?;
+    let no_cache_filters = normalize_no_cache_filters(&build_args.no_cache_filter)?;
+    let cgroup_parent = normalize_cgroup_parent_option(build_args.cgroup_parent.as_deref())?;
 
     let output_dir = build_args
         .output_dir
@@ -325,6 +540,7 @@ pub fn build_image(build_args: &BuildArgs) -> Result<()> {
     fs::create_dir_all(&image_output_dir)?;
 
     let global_args = parse_global_args(&dockerfile);
+    let metadata_build_args = cli_build_args.clone();
 
     let mut executor = Executor::new(
         dockerfile,
@@ -340,12 +556,40 @@ pub fn build_image(build_args: &BuildArgs) -> Result<()> {
     executor.target(build_args.target.clone());
     executor.output_options(build_args.quiet, build_args.progress);
     executor.cli_labels(cli_labels);
+    executor.cli_annotations(cli_annotations);
+    executor.runtime_options(
+        build_args.add_hosts.clone(),
+        build_args.shm_size,
+        build_args.ulimits.clone(),
+        build_args.network,
+        cgroup_parent,
+    );
+    executor.no_cache_filter(no_cache_filters);
 
     executor.build_image()?;
 
     let image_digest = read_primary_image_digest(&image_output_dir, preferred_ref_name.as_deref())?;
     if let Some(iidfile) = build_args.iidfile.as_ref() {
         write_iidfile(iidfile, &image_digest)?;
+    }
+    if build_args.push {
+        let mut pushed_tags = HashSet::new();
+        for tag in &build_args.tags {
+            let push_ref = normalize_push_reference(tag);
+            if pushed_tags.insert(push_ref.clone()) {
+                push_from_layout(push_ref, &image_output_dir, None)?;
+            }
+        }
+    }
+    if let Some(metadata_file) = &build_args.metadata_file {
+        let metadata = BuildMetadata::new(
+            build_args.tags.clone(),
+            image_digest.clone(),
+            image_digest,
+            metadata_build_args,
+            build_started_at.elapsed().as_millis(),
+        );
+        write_metadata_file(metadata_file, &metadata)?;
     }
 
     Ok(())
@@ -356,10 +600,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::image::build_runtime::BuildNetworkMode;
+
     use super::{
-        BuildArgs, BuildProgressMode, derive_output_name, has_explicit_tag, parse_dockerfile,
-        parse_global_args, parse_key_value_options, parse_tags, read_primary_image_digest,
-        resolve_dockerfile_path, unique_ref_names,
+        BuildArgs, BuildProgressMode, derive_output_name, has_explicit_tag,
+        normalize_cgroup_parent_option, normalize_push_reference, parse_add_host_option,
+        parse_dockerfile, parse_global_args, parse_key_value_options, parse_shm_size, parse_tags,
+        parse_ulimit_option, read_primary_image_digest, resolve_dockerfile_path, unique_ref_names,
     };
     use clap::Parser;
     use dockerfile_parser::{BreakableStringComponent, Dockerfile, Instruction, ShellOrExecExpr};
@@ -448,6 +695,16 @@ mod tests {
         assert!(!has_explicit_tag("localhost:5000/ns/app"));
         assert!(has_explicit_tag("nginx:v1"));
         assert!(has_explicit_tag("localhost:5000/ns/app:v1"));
+    }
+
+    #[test]
+    fn test_normalize_push_reference() {
+        assert_eq!(normalize_push_reference("repo/app"), "repo/app:latest");
+        assert_eq!(normalize_push_reference("repo/app:v1"), "repo/app:v1");
+        assert_eq!(
+            normalize_push_reference("localhost:5000/repo/app"),
+            "localhost:5000/repo/app:latest"
+        );
     }
 
     #[test]
@@ -603,6 +860,23 @@ FROM ${BASE}
             "a=b",
             "--progress",
             "plain",
+            "--add-host",
+            "mirror.local:10.0.0.2",
+            "--shm-size",
+            "64m",
+            "--ulimit",
+            "nofile=1024:2048",
+            "--push",
+            "--metadata-file",
+            "/tmp/metadata.json",
+            "--annotation",
+            "org.opencontainers.image.source=https://example.com/repo",
+            "--network",
+            "host",
+            "--cgroup-parent",
+            "rkforge/build",
+            "--no-cache-filter",
+            "builder",
             ".",
         ]);
 
@@ -613,6 +887,85 @@ FROM ${BASE}
         assert_eq!(build_args.iidfile, Some(PathBuf::from("/tmp/iid.txt")));
         assert_eq!(build_args.labels, vec!["a=b".to_string()]);
         assert_eq!(build_args.progress, BuildProgressMode::Plain);
+        assert_eq!(build_args.add_hosts.len(), 1);
+        assert_eq!(build_args.shm_size, Some(64 * 1024 * 1024));
+        assert_eq!(build_args.ulimits.len(), 1);
+        assert!(build_args.push);
+        assert_eq!(
+            build_args.metadata_file,
+            Some(PathBuf::from("/tmp/metadata.json"))
+        );
+        assert_eq!(
+            build_args.annotations,
+            vec!["org.opencontainers.image.source=https://example.com/repo".to_string()]
+        );
+        assert_eq!(build_args.network, BuildNetworkMode::Host);
+        assert_eq!(build_args.cgroup_parent, Some("rkforge/build".to_string()));
+        assert_eq!(build_args.no_cache_filter, vec!["builder".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_add_host_option() {
+        let host = parse_add_host_option("example.local:127.0.0.1").unwrap();
+        assert_eq!(host.host, "example.local");
+        assert_eq!(host.ip.to_string(), "127.0.0.1");
+        assert!(parse_add_host_option("missing-ip").is_err());
+        assert!(parse_add_host_option(":127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_parse_shm_size() {
+        assert_eq!(parse_shm_size("64m").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_shm_size("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_shm_size("1024").unwrap(), 1024);
+        assert!(parse_shm_size("0").is_err());
+        assert!(parse_shm_size("10x").is_err());
+    }
+
+    #[test]
+    fn test_parse_ulimit_option() {
+        let parsed = parse_ulimit_option("nofile=1024:2048").unwrap();
+        assert_eq!(parsed.resource.as_name(), "nofile");
+        assert!(parse_ulimit_option("nofile=2048:1024").is_err());
+        assert!(parse_ulimit_option("foo=1:2").is_err());
+        assert!(parse_ulimit_option("nofile=1").is_err());
+    }
+
+    #[test]
+    fn test_parse_no_cache_filter_option() {
+        let build_args = BuildArgs::parse_from(vec![
+            "rkforge",
+            "--no-cache-filter",
+            "builder",
+            "--no-cache-filter",
+            "1",
+            ".",
+        ]);
+        assert_eq!(
+            build_args.no_cache_filter,
+            vec!["builder".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_network_and_cgroup_parent() {
+        let build_args = BuildArgs::parse_from(vec![
+            "rkforge",
+            "--network",
+            "none",
+            "--cgroup-parent",
+            "rkforge/build",
+            ".",
+        ]);
+        assert_eq!(build_args.network, BuildNetworkMode::None);
+        assert_eq!(build_args.cgroup_parent, Some("rkforge/build".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_cgroup_parent_option() {
+        let normalized = normalize_cgroup_parent_option(Some("./rkforge/build")).unwrap();
+        assert_eq!(normalized, Some("rkforge/build".to_string()));
+        assert!(normalize_cgroup_parent_option(Some("../rkforge")).is_err());
     }
 
     #[test]

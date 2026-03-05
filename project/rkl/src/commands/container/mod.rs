@@ -896,9 +896,10 @@ mod test {
 
     #[test]
     fn test_container_runner_from_spec_and_file() {
+        let image_dir = tempdir().unwrap();
         let spec = ContainerSpec {
             name: "demo1".to_string(),
-            image: "/tmp/demoimg".to_string(),
+            image: image_dir.path().to_string_lossy().to_string(),
             ports: vec![],
             args: vec!["/bin/echo".to_string(), "hi".to_string()],
             resources: None,
@@ -926,10 +927,11 @@ mod test {
 
     #[test]
     fn test_build_config() {
+        let image_dir = tempdir().unwrap();
         let mut runner = ContainerRunner::from_spec(
             ContainerSpec {
                 name: "demo2".to_string(),
-                image: "/tmp/demoimg2".to_string(),
+                image: image_dir.path().to_string_lossy().to_string(),
                 ports: vec![],
                 args: vec![],
                 resources: None,

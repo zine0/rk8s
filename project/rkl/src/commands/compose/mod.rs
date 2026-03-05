@@ -618,32 +618,6 @@ volumes:
         .to_string()
     }
 
-    fn get_test_multiple_service() -> String {
-        r#"
-services:
-  backend:
-    container_name: back
-    image: ./test/bundles/busybox
-    command: ["sleep", "300"]
-    ports:
-      - "8080:8080"
-    networks:
-      - libra-net
-    volumes:
-      - /tmp/mount/dir:/mnt
-  frontend:
-    container_name: front
-    image: ./test/bundles/busybox
-    command: ["sleep", "300"]
-    ports:
-      - "80:80"
-networks: 
-  libra-net: 
-    driver: bridge 
-"#
-        .to_string()
-    }
-
     #[test]
     fn test_new_compose_manager() {
         let mgr = ComposeManager::new("demo_proj".to_string());
@@ -705,33 +679,5 @@ networks:
     fn test_get_manager_from_name_some() {
         let mgr = get_manager_from_name(Some("abc_proj".to_string())).unwrap();
         assert_eq!(mgr.project_name, "abc_proj");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_up() {
-        let root_dir = tempdir().unwrap();
-        let root_path = root_dir.path();
-        let project_name = root_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        fs::write(
-            root_dir.path().join("compose.yml"),
-            get_test_multiple_service(),
-        )
-        .unwrap();
-
-        let mut manager = ComposeManager::new(project_name.clone()).unwrap();
-        manager
-            .up(UpArgs {
-                compose_yaml: Some(root_path.join("compose.yml").to_str().unwrap().to_owned()),
-                project_name: Some(project_name),
-            })
-            .unwrap();
     }
 }

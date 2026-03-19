@@ -1,6 +1,6 @@
 //! DataFetcher: fetch data from blocks according to offset/length, handling gaps with zeros.
 
-use super::chunk::ChunkLayout;
+use super::layout::ChunkLayout;
 use super::slice::{ChunkOffset, SliceDesc, SliceOffset, block_span_iter_slice};
 use super::store::BlockStore;
 use crate::meta::MetaLayer;
@@ -157,8 +157,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chuck::store::InMemoryBlockStore;
-    use crate::chuck::writer::DataUploader;
+    use crate::chunk::store::InMemoryBlockStore;
+    use crate::chunk::writer::DataUploader;
     use crate::meta::SLICE_ID_KEY;
     use crate::meta::factory::create_meta_store_from_url;
     use crate::vfs::backend::Backend;

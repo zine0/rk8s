@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use xlinerpc::status::Status;
 
 pub(crate) use curp::rpc::MethodId;
+pub use xlinerpc::Streaming;
 
 use crate::error::{h3_stream_error_to_status, http_status_to_result};
 use crate::h3_pool::H3ConnectionPool;
@@ -77,6 +78,45 @@ fn grpc_frame_decode<M: Message + Default>(buf: &[u8]) -> Result<(M, usize), Sta
     let msg =
         M::decode(body).map_err(|e| Status::internal(format!("protobuf decode error: {e}")))?;
     Ok((msg, total))
+}
+
+/// Extract a non-OK gRPC status from headers/trailers.
+fn grpc_error_from_headers(headers: &http::HeaderMap) -> Option<Status> {
+    let raw = headers.get("grpc-status")?;
+    let code = raw
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(2);
+    if code == 0 {
+        return None;
+    }
+    let msg = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .map(decode_grpc_message_header)
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(Status::new(code.into(), msg))
+}
+
+fn decode_grpc_message_header(message: &str) -> String {
+    let bytes = message.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = bytes[i + 1] as char;
+            let h2 = bytes[i + 2] as char;
+            if let (Some(hi), Some(lo)) = (h1.to_digit(16), h2.to_digit(16)) {
+                out.push(((hi << 4) as u8) | (lo as u8));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Clone)]
@@ -281,6 +321,11 @@ impl Channel {
         // Check HTTP status
         http_status_to_result(resp.status())?;
 
+        // Check gRPC status from response headers (server may return errors here).
+        if let Some(err) = grpc_error_from_headers(resp.headers()) {
+            return Err(err);
+        }
+
         // Receive gRPC framed response body
         let mut buf = Vec::new();
         loop {
@@ -295,14 +340,8 @@ impl Channel {
                     // Try to get trailers for grpc status
                     if let Ok(Some(trailers)) = stream.recv_trailers().await {
                         tracing::debug!("Received trailers: {:?}", trailers);
-                        if let Some(status) = trailers.get("grpc-status") {
-                            let status_str = status.to_str().unwrap_or("unknown");
-                            if status_str != "0" {
-                                return Err(Status::internal(format!(
-                                    "gRPC error status: {}",
-                                    status_str
-                                )));
-                            }
+                        if let Some(err) = grpc_error_from_headers(&trailers) {
+                            return Err(err);
                         }
                     }
                     return Err(h3_stream_error_to_status(e));
@@ -313,16 +352,8 @@ impl Channel {
         // Always check gRPC status from trailers after all data is received
         if let Ok(Some(trailers)) = stream.recv_trailers().await {
             tracing::debug!("Received trailers: {:?}", trailers);
-            if let Some(status) = trailers.get("grpc-status") {
-                let status_str = status.to_str().unwrap_or("unknown");
-                if status_str != "0" {
-                    let msg = trailers
-                        .get("grpc-message")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("unknown");
-                    let code = status_str.parse::<i32>().unwrap_or(2);
-                    return Err(Status::new(code.into(), msg.to_string()));
-                }
+            if let Some(err) = grpc_error_from_headers(&trailers) {
+                return Err(err);
             }
         }
 
@@ -332,18 +363,8 @@ impl Channel {
         if buf.is_empty() {
             if let Ok(Some(trailers)) = stream.recv_trailers().await {
                 tracing::debug!("Empty body, trailers: {:?}", trailers);
-                if let Some(status) = trailers.get("grpc-status") {
-                    let status_str = status.to_str().unwrap_or("unknown");
-                    if status_str != "0" {
-                        let msg = trailers
-                            .get("grpc-message")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("unknown");
-                        return Err(Status::internal(format!(
-                            "gRPC error: {} - {}",
-                            status_str, msg
-                        )));
-                    }
+                if let Some(err) = grpc_error_from_headers(&trailers) {
+                    return Err(err);
                 }
             }
             return Err(Status::internal("empty response body"));
@@ -406,6 +427,11 @@ impl Channel {
         // Check HTTP status
         http_status_to_result(resp.status())?;
 
+        // Check gRPC status from response headers (server may return errors here).
+        if let Some(err) = grpc_error_from_headers(resp.headers()) {
+            return Err(err);
+        }
+
         // Spawn a background task to drive the h3 connection
         let _ = tokio::spawn(async move {
             let _ = h3_driver.wait_idle().await;
@@ -464,6 +490,11 @@ impl Channel {
 
         // Check HTTP status
         http_status_to_result(resp.status())?;
+
+        // Check gRPC status from response headers (server may return errors here).
+        if let Some(err) = grpc_error_from_headers(resp.headers()) {
+            return Err(err);
+        }
 
         // Spawn a background task to drive the h3 connection
         let _ = tokio::spawn(async move {
@@ -568,36 +599,5 @@ where
             }
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-/// QUIC-backed response stream used by xline client streaming APIs.
-pub struct Streaming<T> {
-    inner: Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>,
-}
-
-impl<T> std::fmt::Debug for Streaming<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Streaming").finish_non_exhaustive()
-    }
-}
-
-impl<T> Streaming<T> {
-    #[inline]
-    fn new(inner: Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>) -> Self {
-        Self { inner }
-    }
-
-    /// Receive the next message from the stream.
-    pub async fn message(&mut self) -> Result<Option<T>, Status> {
-        self.inner.next().await.transpose()
-    }
-}
-
-impl<T> Stream for Streaming<T> {
-    type Item = Result<T, Status>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
     }
 }

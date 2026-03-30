@@ -14,11 +14,7 @@ use curp::{
 use dashmap::DashMap;
 use engine::{MemorySnapshotAllocator, RocksSnapshotAllocator, SnapshotAllocator};
 use jsonwebtoken::{DecodingKey, EncodingKey};
-use tonic::{
-    // TODO: use our own status type
-    // use xlinerpc::status::Status;
-    transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig},
-};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tracing::{info, warn};
 
 use utils::{
@@ -606,7 +602,7 @@ impl XlineServer {
                 Arc::clone(&client),
                 id_gen,
                 Arc::clone(&self.cluster_info),
-                self.client_tls_config.clone(),
+                Arc::clone(&self.quic_client),
                 &self.task_manager,
             ),
             AuthServer::new(Arc::clone(&client), Arc::clone(&auth_storage)),

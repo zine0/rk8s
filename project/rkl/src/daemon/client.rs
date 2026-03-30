@@ -22,6 +22,16 @@ use crate::quic::client::{Daemon as ClientDaemon, QUICClient};
 use sysinfo::{Disks, System};
 use tracing::{error, info, warn};
 
+fn nft_rules_phase(rules: &str) -> &'static str {
+    if rules.contains("\"map\":\"verdict\"")
+        && (rules.contains("\"name\":\"cluster_ips\"") || rules.contains("\"name\":\"node_ports\""))
+    {
+        "map_init"
+    } else {
+        "full_rules"
+    }
+}
+
 fn get_subnet_file_path() -> String {
     if let Ok(path) = env::var("SUBNET_FILE_PATH") {
         info!("Using custom subnet file path: {path}");
@@ -385,18 +395,22 @@ pub async fn run_once(
                             crate::config::set_registry_credentials(creds);
                         }
                         Ok(RksMessage::SetNftablesRules(rules)) => {
+                            let phase = nft_rules_phase(&rules);
                             info!(
-                                "[worker] received nftables rules (len={}):{}",
+                                "[worker] received nftables rules phase={} (len={})",
+                                phase,
                                 rules.len(),
-                                rules
                             );
                             match network_receiver.apply_nft_rules(rules).await {
                                 Ok(()) => {
-                                    info!("[worker] nftables rules applied");
+                                    info!("[worker] nftables rules applied phase={}", phase);
                                     let _ = client.send_msg(&RksMessage::Ack).await;
                                 }
                                 Err(e) => {
-                                    error!("[worker] failed to apply nftables rules: {e}");
+                                    error!(
+                                        "[worker] failed to apply nftables rules phase={}: {e}",
+                                        phase
+                                    );
                                     let _ = client
                                         .send_msg(&RksMessage::Error(format!(
                                             "apply nftables failed: {e}"
@@ -407,9 +421,8 @@ pub async fn run_once(
                         }
                         Ok(RksMessage::UpdateNftablesRules(rules)) => {
                             info!(
-                                "[worker] received nftables rules update (len={}):{}",
-                                rules.len(),
-                                rules,
+                                "[worker] received nftables rules update (len={})",
+                                rules.len()
                             );
                             match network_receiver.apply_nft_rules(rules).await {
                                 Ok(()) => {

@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "dagrs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "dagrs-derive"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -49,7 +49,8 @@ use crate::fuse::mount::mount_vfs_unprivileged;
 use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::{
-    CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType, MetaClientConfig,
+    CacheConfig, ClientOptions, CompactConfig, Config, DatabaseConfig, DatabaseType,
+    MetaClientConfig,
 };
 use crate::meta::factory::MetaStoreFactory;
 use crate::meta::layer::MetaLayer;
@@ -230,8 +231,13 @@ where
         .await
         .map_err(anyhow::Error::from)?;
 
-    let fs =
-        VFS::with_meta_layer(layout, store, meta_client.clone()).map_err(anyhow::Error::from)?;
+    let fs = VFS::with_meta_layer_with_compact_config(
+        layout,
+        store,
+        meta_client.clone(),
+        meta_config.compact.clone(),
+    )
+    .map_err(anyhow::Error::from)?;
     let handle = mount_vfs_unprivileged(fs, mount_point).await?;
 
     println!("mounted at {}", mount_point.display());
@@ -389,6 +395,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
     match args.meta_backend {
         MetaBackendKind::Sqlx => {
             let client = ClientOptions::default();
+            let compact = CompactConfig::default();
 
             let config = Config {
                 database: DatabaseConfig {
@@ -396,6 +403,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 },
                 cache: CacheConfig::default(),
                 client,
+                compact,
             };
             let handle = MetaStoreFactory::<DatabaseMetaStore>::create_from_config(config).await?;
             Ok(handle.store() as Arc<dyn MetaStore>)
@@ -406,6 +414,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
             }
 
             let client = ClientOptions::default();
+            let compact = CompactConfig::default();
 
             let config = Config {
                 database: DatabaseConfig {
@@ -415,12 +424,14 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 },
                 cache: CacheConfig::default(),
                 client,
+                compact,
             };
             let handle = MetaStoreFactory::<EtcdMetaStore>::create_from_config(config).await?;
             Ok(handle.store() as Arc<dyn MetaStore>)
         }
         MetaBackendKind::Redis => {
             let client = ClientOptions::default();
+            let compact = CompactConfig::default();
 
             let config = Config {
                 database: DatabaseConfig {
@@ -430,6 +441,7 @@ async fn create_meta_store(args: &MountConfig) -> anyhow::Result<Arc<dyn MetaSto
                 },
                 cache: CacheConfig::default(),
                 client,
+                compact,
             };
             let handle = MetaStoreFactory::<RedisMetaStore>::create_from_config(config).await?;
             Ok(handle.store() as Arc<dyn MetaStore>)

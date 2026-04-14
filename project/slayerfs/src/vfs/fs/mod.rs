@@ -1,9 +1,10 @@
 //! FUSE/SDK-friendly VFS with path-based metadata ops and handle-based IO.
 
-use crate::chunk::layout::ChunkLayout;
 use crate::chunk::store::BlockStore;
+use crate::chunk::{BlockGcConfig, ChunkLayout, CompactionWorker, CompactionWorkerConfig};
 use crate::meta::MetaLayer;
 use crate::meta::client::MetaClient;
+use crate::meta::config::CompactConfig;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{AclRule, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
@@ -26,6 +27,58 @@ pub struct RenameFlags {
     pub exchange: bool,
     /// Remove the destination if it's a whiteout (RENAME_WHITEOUT)
     pub whiteout: bool,
+}
+
+/// Configuration for VFS background tasks
+#[derive(Debug, Clone)]
+pub struct VfsBackgroundConfig {
+    pub compaction: CompactionWorkerConfig,
+    pub gc: BlockGcConfig,
+    pub compact_config: CompactConfig,
+    pub enabled: bool,
+}
+
+impl VfsBackgroundConfig {
+    pub fn from_compact_config(
+        layout: &ChunkLayout,
+        compact_config: CompactConfig,
+        enabled: bool,
+    ) -> Self {
+        let compaction = CompactionWorkerConfig {
+            scan_interval: compact_config.interval,
+            max_chunks_per_run: compact_config.max_chunks_per_run,
+            enabled,
+        };
+
+        let gc = BlockGcConfig {
+            block_size: layout.block_size as u64,
+            interval: compact_config.interval,
+            ..Default::default()
+        };
+
+        Self {
+            compaction,
+            gc,
+            compact_config,
+            enabled,
+        }
+    }
+}
+
+impl Default for VfsBackgroundConfig {
+    fn default() -> Self {
+        Self {
+            compaction: CompactionWorkerConfig::default(),
+            gc: BlockGcConfig::default(),
+            compact_config: CompactConfig::default(),
+            enabled: true,
+        }
+    }
+}
+
+struct VfsBackgroundTasks {
+    compaction_handle: tokio::task::JoinHandle<()>,
+    gc_handle: tokio::task::JoinHandle<()>,
 }
 
 use crate::vfs::Inode;
@@ -253,6 +306,9 @@ where
 {
     core: Arc<VfsCore<S, M>>,
     state: Arc<VfsState<S, M>>,
+    /// Background tasks (compaction and gc) - only present when enabled
+    #[allow(dead_code)]
+    background_tasks: Option<VfsBackgroundTasks>,
 }
 
 impl<S, M> Clone for VFS<S, M>
@@ -264,6 +320,8 @@ where
         Self {
             core: Arc::clone(&self.core),
             state: Arc::clone(&self.state),
+            // Note: background tasks are not cloned as they should be unique per VFS instance
+            background_tasks: None,
         }
     }
 }
@@ -297,7 +355,84 @@ where
 
         meta_client.initialize().await.map_err(VfsError::from)?;
 
-        Self::from_components(VFSConfig::new(layout), store, meta_client)
+        Self::with_meta_layer_with_compact_config(layout, store, meta_client, config.compact)
+    }
+}
+
+impl<S, R> VFS<S, MetaClient<R>>
+where
+    S: BlockStore + Send + Sync + 'static,
+    R: MetaStore + Send + Sync + ?Sized + 'static,
+{
+    pub(crate) fn with_meta_layer_with_compact_config(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta_layer: Arc<MetaClient<R>>,
+        compact_config: CompactConfig,
+    ) -> Result<Self, VfsError> {
+        let enabled = !meta_layer.options().no_background_jobs;
+        let bg_config = VfsBackgroundConfig::from_compact_config(&layout, compact_config, enabled);
+        let background_tasks =
+            Self::start_background_tasks(&meta_layer, Arc::clone(&store), layout, bg_config);
+
+        Self::from_components_with_background(
+            VFSConfig::new(layout),
+            store,
+            meta_layer,
+            background_tasks,
+        )
+    }
+
+    pub(crate) fn with_meta_layer_with_default_background(
+        layout: ChunkLayout,
+        store: Arc<S>,
+        meta_layer: Arc<MetaClient<R>>,
+    ) -> Result<Self, VfsError> {
+        Self::with_meta_layer_with_compact_config(
+            layout,
+            store,
+            meta_layer,
+            CompactConfig::default(),
+        )
+    }
+
+    /// Start background compaction and gc tasks
+    fn start_background_tasks(
+        meta_client: &Arc<MetaClient<R>>,
+        block_store: Arc<S>,
+        layout: ChunkLayout,
+        config: VfsBackgroundConfig,
+    ) -> Option<VfsBackgroundTasks> {
+        if !config.enabled {
+            return None;
+        }
+
+        let meta_store = meta_client.store();
+        let is_database_store = meta_store.name() == "database";
+
+        let mut worker = CompactionWorker::with_config(
+            meta_store,
+            block_store,
+            layout,
+            config.compact_config.clone(),
+            config.compact_config.lock_ttl.clone(),
+        );
+
+        if is_database_store {
+            let client = Arc::clone(meta_client);
+            worker = worker.with_compaction_hook(Arc::new(move |chunk_id| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client.invalidate_chunk_slices(chunk_id).await;
+                });
+            }));
+        }
+        let (compaction_handle, gc_handle) = worker.start(config.compaction, config.gc);
+
+        Some(VfsBackgroundTasks {
+            compaction_handle,
+            gc_handle,
+        })
     }
 }
 
@@ -307,19 +442,11 @@ where
     S: BlockStore + Send + Sync + 'static,
     M: MetaLayer + Send + Sync + 'static,
 {
-    pub(crate) fn with_meta_layer(
-        layout: ChunkLayout,
-        store: Arc<S>,
-        meta_layer: Arc<M>,
-    ) -> Result<Self, VfsError> {
-        let config = VFSConfig::new(layout);
-        Self::from_components(config, store, meta_layer)
-    }
-
-    fn from_components(
+    fn from_components_with_background(
         config: VFSConfig,
         store: Arc<S>,
         meta_layer: Arc<M>,
+        background_tasks: Option<VfsBackgroundTasks>,
     ) -> Result<Self, VfsError> {
         let layout = config.write.layout;
         let root_ino = meta_layer.root_ino();
@@ -328,7 +455,11 @@ where
         let config = Arc::new(config);
         let state = Arc::new(VfsState::new(config, backend));
 
-        Ok(Self { core, state })
+        Ok(Self {
+            core,
+            state,
+            background_tasks,
+        })
     }
 
     pub(crate) fn root_ino(&self) -> i64 {

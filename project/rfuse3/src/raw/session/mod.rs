@@ -36,6 +36,8 @@ use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
 use async_fs::read_dir;
@@ -50,7 +52,10 @@ use async_global_executor::{self as task, Task as JoinHandle};
 use async_process::Command;
 use bincode::Options;
 use bytes::Bytes;
-use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures_channel::{
+    mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use futures_util::future::{Either, FutureExt};
 use futures_util::select;
 use futures_util::sink::SinkExt;
@@ -85,6 +90,55 @@ use crate::raw::reply::ReplyXAttr;
 use crate::raw::request::Request;
 use crate::raw::FuseData;
 use crate::{MountOptions, SetAttr};
+
+#[cfg(target_os = "macos")]
+const MACFUSE_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(target_os = "macos")]
+async fn wait_for_mount_init_ready(ready_rx: oneshot::Receiver<IoResult<()>>) -> IoResult<()> {
+    #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+    {
+        match tokio::time::timeout(MACFUSE_INIT_TIMEOUT, ready_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(IoError::other(
+                "FUSE mount task ended before init completed",
+            )),
+            Err(_) => Err(IoError::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {:?} waiting for FUSE INIT",
+                    MACFUSE_INIT_TIMEOUT
+                ),
+            )),
+        }
+    }
+
+    #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+    {
+        let ready = FutureExt::fuse(ready_rx);
+        let timeout = FutureExt::fuse(async_io::Timer::after(MACFUSE_INIT_TIMEOUT));
+        let mut ready = pin!(ready);
+        let mut timeout = pin!(timeout);
+
+        select! {
+            result = ready => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => Err(IoError::other("FUSE mount task ended before init completed")),
+                }
+            }
+            _ = timeout => {
+                Err(IoError::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {:?} waiting for FUSE INIT",
+                        MACFUSE_INIT_TIMEOUT
+                    ),
+                ))
+            }
+        }
+    }
+}
 
 /// A Future which returns when a file system is unmounted
 ///
@@ -130,10 +184,7 @@ struct MountHandleInner {
     task: JoinHandle<IoResult<()>>,
     mount_path: PathBuf,
     destroy_notify: Arc<async_notify::Notify>,
-    #[cfg(any(
-        all(target_os = "linux", feature = "unprivileged"),
-        target_os = "macos"
-    ))]
+    #[cfg(all(target_os = "linux", feature = "unprivileged"))]
     unprivileged: bool,
 }
 
@@ -442,14 +493,23 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         self.filesystem.replace(Arc::new(fs));
 
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = task::spawn(self.inner_mount(Some(ready_tx)));
+        if let Err(err) = wait_for_mount_init_ready(ready_rx).await {
+            #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
+            task.abort();
+            #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
+            let _ = task.cancel().await;
+            return Err(err);
+        }
+
         debug!("mount {:?} success", mount_path);
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task,
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
-                unprivileged: true,
             }),
         })
     }
@@ -481,7 +541,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: task::spawn(self.inner_mount(None)),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
@@ -531,7 +591,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: task::spawn(self.inner_mount(None)),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
@@ -574,7 +634,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         Ok(MountHandle {
             inner: Some(MountHandleInner {
-                task: task::spawn(self.inner_mount()),
+                task: task::spawn(self.inner_mount(None)),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
             }),
@@ -586,12 +646,15 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         self.mount_with_unprivileged(fs, mount_path).await
     }
 
-    async fn inner_mount(mut self) -> IoResult<()> {
+    async fn inner_mount(
+        mut self,
+        ready_sender: Option<oneshot::Sender<IoResult<()>>>,
+    ) -> IoResult<()> {
         let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
 
         let receiver = self.response_receiver.take().unwrap();
 
-        let dispatch_task = self.dispatch().fuse();
+        let dispatch_task = self.dispatch(ready_sender).fuse();
         let mut dispatch_task = pin!(dispatch_task);
 
         #[cfg(all(not(feature = "tokio-runtime"), feature = "async-io-runtime"))]
@@ -823,12 +886,34 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         }
     }
 
-    async fn dispatch(&mut self) -> IoResult<()> {
+    async fn dispatch(
+        &mut self,
+        mut ready_sender: Option<oneshot::Sender<IoResult<()>>>,
+    ) -> IoResult<()> {
         let fuse_connection = self.fuse_connection.take().unwrap();
         let fs = self.filesystem.take().expect("filesystem not init");
         // defer worker initialization until after FUSE INIT handshake
 
-        let max_write = self.init_filesystem(&fs, &fuse_connection).await?.get() as usize;
+        let max_write = match self.init_filesystem(&fs, &fuse_connection).await {
+            Ok(max_write) => {
+                if let Some(sender) = ready_sender.take() {
+                    let _ = sender.send(Ok(()));
+                }
+                max_write.get() as usize
+            }
+            Err(err) => {
+                if let Some(sender) = ready_sender.take() {
+                    let return_err = if let Some(raw_os_error) = err.raw_os_error() {
+                        IoError::from_raw_os_error(raw_os_error)
+                    } else {
+                        IoError::new(err.kind(), err.to_string())
+                    };
+                    let _ = sender.send(Err(err));
+                    return Err(return_err);
+                }
+                return Err(err);
+            }
+        };
         let workers_active = self.worker_count > 1;
         if workers_active {
             self.ensure_workers(fs.clone());

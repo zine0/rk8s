@@ -48,7 +48,7 @@ use util::{
 
 use vm_memory::bitmap::BitmapSlice;
 
-use nix::sys::resource::{Resource, getrlimit};
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
 pub mod async_io;
 mod config;
@@ -77,6 +77,9 @@ pub const PROC_SELF_FD_CSTR: &[u8] = b"/dev/fd\0";
 pub const ROOT_ID: u64 = 1;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
+const MIN_PASSTHROUGH_NOFILE_SOFT_LIMIT: u64 = 8192;
+const RESERVED_FILE_DESCRIPTORS: u64 = 64;
+
 #[derive(Debug, Clone)]
 pub struct PassthroughArgs<P, M>
 where
@@ -97,6 +100,16 @@ pub async fn new_passthroughfs_layer<P: AsRef<Path>, M: AsRef<str>>(
         do_import: true,
         ..Default::default()
     };
+    #[cfg(target_os = "macos")]
+    {
+        // macOS does not provide Linux-style O_PATH/open_by_handle_at support, so
+        // inode lookups may temporarily pin real file descriptors. Keep kernel
+        // metadata caching short to release those lookup references promptly.
+        config.entry_timeout = Duration::ZERO;
+        config.attr_timeout = Duration::ZERO;
+        config.dir_entry_timeout = Some(Duration::ZERO);
+        config.dir_attr_timeout = Some(Duration::ZERO);
+    }
     if let Some(mapping) = args.mapping {
         config.mapping = mapping
             .as_ref()
@@ -122,6 +135,33 @@ pub async fn new_passthroughfs_layer<P: AsRef<Path>, M: AsRef<str>>(
 
 type Inode = u64;
 type Handle = u64;
+
+fn desired_nofile_soft_limit(soft: u64, hard: u64, minimum: u64) -> Option<u64> {
+    if soft >= minimum || hard <= soft {
+        return None;
+    }
+
+    Some(cmp::min(minimum, hard))
+}
+
+fn raise_nofile_soft_limit(minimum: u64) -> u64 {
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return minimum;
+    };
+
+    if let Some(target) = desired_nofile_soft_limit(soft, hard, minimum) {
+        match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+            Ok(()) => return target,
+            Err(err) => {
+                warn!(
+                    "passthroughfs: failed to raise RLIMIT_NOFILE from {soft} to {target}: {err}"
+                );
+            }
+        }
+    }
+
+    soft
+}
 
 /// Maximum host inode number supported by passthroughfs
 const MAX_HOST_INO: u64 = 0x7fff_ffff_ffff;
@@ -544,10 +584,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
         let mount_fds = MountFds::new(None)?;
 
-        let fd_limit = match getrlimit(Resource::RLIMIT_NOFILE) {
-            Ok((soft, _)) => soft,
-            Err(_) => 65536,
-        };
+        let fd_limit = raise_nofile_soft_limit(MIN_PASSTHROUGH_NOFILE_SOFT_LIMIT);
 
         let max_mmap_size = if cfg.use_mmap { cfg.max_mmap_size } else { 0 };
 
@@ -590,7 +627,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
 
             phantom: PhantomData,
 
-            handle_cache: moka::future::Cache::new(fd_limit),
+            handle_cache: moka::future::Cache::new(
+                fd_limit.saturating_sub(RESERVED_FILE_DESCRIPTORS).max(1),
+            ),
 
             mmap_chunks: mmap_cache_builder.build(),
         })
@@ -713,7 +752,20 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         //if self.os_facts.has_openat2 {
         //    oslib::do_open_relative_to(dir, pathname, flags, mode)
         //} else {
-        openat(dir, pathname, flags, mode)
+        #[cfg(target_os = "macos")]
+        {
+            match openat(dir, pathname, flags, mode) {
+                Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+                    let symlink_flags = (flags & !libc::O_NOFOLLOW) | libc::O_SYMLINK;
+                    openat(dir, pathname, symlink_flags, mode)
+                }
+                result => result,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            openat(dir, pathname, flags, mode)
+        }
         //}
     }
 
@@ -1313,6 +1365,19 @@ mod tests {
         };
     }
 
+    #[test]
+    fn nofile_limit_raise_is_capped_by_hard_limit() {
+        assert_eq!(
+            super::desired_nofile_soft_limit(256, 4096, 8192),
+            Some(4096)
+        );
+        assert_eq!(
+            super::desired_nofile_soft_limit(256, 16384, 8192),
+            Some(8192)
+        );
+        assert_eq!(super::desired_nofile_soft_limit(8192, 16384, 8192), None);
+    }
+
     /// This test attempts to mount a passthrough filesystem. In many CI/unprivileged
     /// environments operations like `allow_other` or FUSE mounting may return
     /// EPERM/EACCES. Instead of failing the whole test suite, we skip the test
@@ -1355,6 +1420,28 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_lookup_symlink_entry_does_not_return_eloop() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("target.txt"), "target").unwrap();
+        symlink("target.txt", temp_dir.path().join("link.txt")).unwrap();
+
+        let fs = new_passthroughfs_layer(PassthroughArgs {
+            root_dir: temp_dir.path(),
+            mapping: None::<&str>,
+        })
+        .await
+        .unwrap();
+        let name = CStr::from_bytes_with_nul(b"link.txt\0").unwrap();
+
+        let entry = fs.do_lookup(ROOT_ID, name).await.unwrap();
+
+        assert_eq!(entry.attr.kind, rfuse3::FileType::Symlink);
     }
 
     // // Test for uid/gid mapping

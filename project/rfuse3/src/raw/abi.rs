@@ -553,7 +553,7 @@ pub struct fuse_attr_out {
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
+#[allow(dead_code, non_camel_case_types)]
 pub struct fuse_getxtimes_out {
     pub bkuptime: u64,
     pub crtime: u64,
@@ -589,6 +589,7 @@ pub struct fuse_rename_in {
     pub newdir: u64,
     // https://github.com/osxfuse/fuse/blob/master/include/fuse_kernel.h#L448
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub flags: u32,
     #[cfg(target_os = "macos")]
     _padding: u32,
@@ -606,7 +607,7 @@ pub struct fuse_rename2_in {
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-#[allow(non_camel_case_types)]
+#[allow(dead_code, non_camel_case_types)]
 pub struct fuse_exchange_in {
     pub olddir: u64,
     pub newdir: u64,
@@ -774,6 +775,7 @@ pub struct fuse_getxattr_in {
     pub size: u32,
     _padding: u32,
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub position: u32,
     #[cfg(target_os = "macos")]
     _padding2: u32,

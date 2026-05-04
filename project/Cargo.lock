@@ -4923,6 +4923,7 @@ dependencies = [
  "futures-util",
  "itertools 0.14.0",
  "libc",
+ "lru 0.16.3",
  "memmap2",
  "moka",
  "nix 0.29.0",

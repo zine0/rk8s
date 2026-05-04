@@ -94,6 +94,111 @@ use crate::{MountOptions, SetAttr};
 #[cfg(target_os = "macos")]
 const MACFUSE_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn is_ignorable_reply_error(err: &IoError) -> bool {
+    match err.raw_os_error() {
+        Some(errno) if errno == libc::ENOENT => true,
+        #[cfg(target_os = "macos")]
+        Some(errno) if errno == libc::EINVAL => true,
+        _ => false,
+    }
+}
+
+fn negotiate_readdirplus(kernel_flags: u32, force: bool) -> (u32, bool) {
+    let supports_readdirplus = kernel_flags & FUSE_DO_READDIRPLUS > 0;
+    let supports_auto = kernel_flags & FUSE_READDIRPLUS_AUTO > 0;
+    let force_active = force && supports_readdirplus;
+    let mut reply_flags = 0;
+
+    if supports_readdirplus {
+        reply_flags |= FUSE_DO_READDIRPLUS;
+    }
+
+    if supports_auto && !force_active {
+        reply_flags |= FUSE_READDIRPLUS_AUTO;
+    }
+
+    // macOS-only INIT probe (PR-9.2). Empirically, macFUSE 4.x advertises
+    // `kernel_flags=0xef800008` on INIT — bits 13 (FUSE_DO_READDIRPLUS)
+    // and 14 (FUSE_READDIRPLUS_AUTO) are both clear. The Linux-only gate
+    // on `MountOptions::force_readdir_plus(true)` therefore matches the
+    // kernel reality; we keep the negotiation function platform-neutral
+    // for forward-compat (a future macFUSE may add the bits) and leave a
+    // `debug!` line so the negotiated state is recoverable from a normal
+    // `RUST_LOG=debug` run.
+    #[cfg(target_os = "macos")]
+    tracing::debug!(
+        target: "rfuse3::init_probe",
+        "readdirplus negotiation: kernel_flags=0x{kernel_flags:08x} \
+         supports_readdirplus={supports_readdirplus} \
+         supports_auto={supports_auto} \
+         force_requested={force} force_active={force_active} \
+         reply_flags=0x{reply_flags:08x}"
+    );
+
+    (reply_flags, force_active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_ignorable_reply_error, negotiate_readdirplus};
+    use crate::raw::abi::{FUSE_DO_READDIRPLUS, FUSE_READDIRPLUS_AUTO};
+    use std::io::Error as IoError;
+
+    #[test]
+    fn enoent_reply_errors_are_ignorable() {
+        let err = IoError::from_raw_os_error(libc::ENOENT);
+
+        assert!(is_ignorable_reply_error(&err));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_einval_reply_errors_are_ignorable() {
+        let err = IoError::from_raw_os_error(libc::EINVAL);
+
+        assert!(is_ignorable_reply_error(&err));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_einval_reply_errors_are_not_ignorable() {
+        let err = IoError::from_raw_os_error(libc::EINVAL);
+
+        assert!(!is_ignorable_reply_error(&err));
+    }
+
+    #[test]
+    fn force_readdirplus_does_not_advertise_unsupported_capability() {
+        let (reply_flags, force_active) = negotiate_readdirplus(0, true);
+
+        assert_eq!(reply_flags & FUSE_DO_READDIRPLUS, 0);
+        assert!(!force_active);
+    }
+
+    #[test]
+    fn force_readdirplus_activates_when_kernel_supports_it() {
+        let (reply_flags, force_active) = negotiate_readdirplus(FUSE_DO_READDIRPLUS, true);
+
+        assert_ne!(reply_flags & FUSE_DO_READDIRPLUS, 0);
+        assert!(force_active);
+    }
+
+    #[test]
+    fn readdirplus_auto_is_disabled_only_when_force_is_active() {
+        let (reply_flags, force_active) =
+            negotiate_readdirplus(FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO, true);
+
+        assert!(force_active);
+        assert_eq!(reply_flags & FUSE_READDIRPLUS_AUTO, 0);
+
+        let (reply_flags, force_active) =
+            negotiate_readdirplus(FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO, false);
+
+        assert!(!force_active);
+        assert_ne!(reply_flags & FUSE_READDIRPLUS_AUTO, 0);
+    }
+}
+
 #[cfg(target_os = "macos")]
 async fn wait_for_mount_init_ready(ready_rx: oneshot::Receiver<IoResult<()>>) -> IoResult<()> {
     #[cfg(all(not(feature = "async-io-runtime"), feature = "tokio-runtime"))]
@@ -349,6 +454,7 @@ pub struct Session<FS: Filesystem + Send + Sync + 'static> {
     _per_inode_serial: bool,
     /// Internal worker pool (created lazily when worker_count > 1).
     workers: Option<Workers<FS>>,
+    force_readdir_plus_active: bool,
     inflight: Arc<AtomicUsize>,
     inflight_notify: Arc<async_notify::Notify>,
 }
@@ -370,6 +476,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             max_background: DEFAULT_MAX_BACKGROUND as usize,
             _per_inode_serial: false,
             workers: None,
+            force_readdir_plus_active: false,
             inflight: Arc::new(AtomicUsize::new(0)),
             inflight_notify: Arc::new(async_notify::Notify::new()),
         }
@@ -410,6 +517,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 fs,
                 resp: self.response_sender.clone(),
                 direct_io: self.mount_options.direct_io,
+                force_readdir_plus: self.force_readdir_plus_active,
                 _inflight: self.inflight.clone(),
                 _inflight_notify: self.inflight_notify.clone(),
             });
@@ -715,8 +823,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             };
 
             if let Err(err) = fuse_connection.write_vectored(data, extend_data).await.1 {
-                use std::io::ErrorKind;
-                if err.kind() == ErrorKind::NotFound {
+                if is_ignorable_reply_error(&err) {
                     warn!(
                         "may reply interrupted fuse request, ignore this error {}",
                         err
@@ -1386,17 +1493,22 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             reply_flags |= FUSE_AUTO_INVAL_DATA;
         }
 
-        if init_in.flags & FUSE_DO_READDIRPLUS > 0 || self.mount_options.force_readdir_plus {
+        let (readdirplus_flags, force_readdir_plus_active) =
+            negotiate_readdirplus(init_in.flags, self.mount_options.force_readdir_plus);
+        if readdirplus_flags & FUSE_DO_READDIRPLUS > 0 {
             debug!("enable FUSE_DO_READDIRPLUS");
-
-            reply_flags |= FUSE_DO_READDIRPLUS;
         }
 
-        if init_in.flags & FUSE_READDIRPLUS_AUTO > 0 && !self.mount_options.force_readdir_plus {
+        if readdirplus_flags & FUSE_READDIRPLUS_AUTO > 0 {
             debug!("enable FUSE_READDIRPLUS_AUTO");
-
-            reply_flags |= FUSE_READDIRPLUS_AUTO;
         }
+
+        if self.mount_options.force_readdir_plus && !force_readdir_plus_active {
+            warn!("force_readdir_plus requested but kernel did not advertise FUSE_DO_READDIRPLUS");
+        }
+
+        reply_flags |= readdirplus_flags;
+        self.force_readdir_plus_active = force_readdir_plus_active;
 
         if init_in.flags & FUSE_ASYNC_DIO > 0 {
             debug!("enable FUSE_ASYNC_DIO");
@@ -3319,7 +3431,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
         data: &[u8],
         fs: &Arc<FS>,
     ) {
-        if self.mount_options.force_readdir_plus {
+        if self.force_readdir_plus_active {
             reply_error_in_place(libc::ENOSYS.into(), request, &self.response_sender).await;
 
             return;
